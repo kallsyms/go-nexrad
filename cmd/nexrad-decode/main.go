@@ -34,15 +34,7 @@ func main() {
 	}
 	logrus.SetLevel(errorLevels[cli.LogLevel])
 
-	// make sure the file is legit
-	f, err := os.Open(cli.Args.Filename)
-	defer f.Close()
-	if err != nil {
-		logrus.Error(err)
-		return
-	}
-
 	// decode it
 	logrus.Info(color.CyanString("decoding ", cli.Args.Filename))
-	archive2.Extract(f)
+	archive2.NewArchive2(cli.Args.Filename)
 }

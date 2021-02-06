@@ -5,31 +5,36 @@ import (
 	"compress/bzip2"
 	"encoding/binary"
 	"io"
-	"time"
+	"os"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/sirupsen/logrus"
 )
 
 // Archive2 wrapper for processed archive 2 data files.
 type Archive2 struct {
-	// ElevationScans contains all the messages for every elevation scan in the volume
-	ElevationScans map[int][]*Message31
 	VolumeHeader   VolumeHeaderRecord
+	ElevationScans map[int][]*Message31
 }
 
-// Extract data from a given archive 2 data file.
-func Extract(f io.ReadSeeker) *Archive2 {
+// NewArchive2 returns a new Archive2 from the provided file
+func NewArchive2(filename string) *Archive2 {
 
 	ar2 := Archive2{
 		ElevationScans: make(map[int][]*Message31),
 		VolumeHeader:   VolumeHeaderRecord{},
 	}
 
+	// try to open the file
+	file, err := os.Open(filename)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
 	// -------------------------- Volume Header Record -------------------------
 
 	// read in the volume header record
-	binary.Read(f, binary.BigEndian, &ar2.VolumeHeader)
+	binary.Read(file, binary.BigEndian, &ar2.VolumeHeader)
+	logrus.Debug(ar2.VolumeHeader.FileName())
 
 	// ------------------------------ LDM Records ------------------------------
 
@@ -40,16 +45,15 @@ func Extract(f io.ReadSeeker) *Archive2 {
 	// records containing 120 radial messages (type 31) plus 0 or more RDA Status
 	// messages (type 2).
 
-	skipLDMRecord := true
 	for true {
 		ldm := LDMRecord{}
 
 		// read in control word (size) of LDM record
-		if err := binary.Read(f, binary.BigEndian, &ldm.Size); err != nil {
+		if err := binary.Read(file, binary.BigEndian, &ldm.Size); err != nil {
 			if err != io.EOF {
 				logrus.Panic(err.Error())
 			}
-			return &ar2
+			return nil
 		}
 
 		// As the control word contains a negative size under some circumstances,
@@ -59,89 +63,63 @@ func Extract(f io.ReadSeeker) *Archive2 {
 			ldm.Size = -ldm.Size
 		}
 
-		// logrus.Debug("---------------- LDM Compressed Record ----------------")
+		logrus.Debugf("LDM Compressed Record (%d bytes)", ldm.Size)
 
-		msgBuf := decompress(f, ldm.Size)
+		var compressedRecord = make([]byte, ldm.Size)
+		binary.Read(file, binary.BigEndian, &compressedRecord)
+		bzipReader := bzip2.NewReader(bytes.NewReader(compressedRecord))
 
 		for true {
 
-			if skipLDMRecord {
-				skipLDMRecord = false
-				break
-			}
-
 			// eat 12 bytes due to legacy compliance of CTM Header, these are all set to nil
-			msgBuf.Seek(LegacyCTMHeaderLen, io.SeekCurrent)
+			bzipReader.Read(make([]byte, 12))
 
 			header := MessageHeader{}
-			if err := binary.Read(msgBuf, binary.BigEndian, &header); err != nil {
+			if err := binary.Read(bzipReader, binary.BigEndian, &header); err != nil {
 				if err != io.EOF {
 					logrus.Panic(err.Error())
 				}
 				break
 			}
-			// logrus.Debugf("== Message %d (i: %d, size: %d)", header.MessageType, header.IDSequenceNumber, header.MessageSize)
 
-			// spew.Dump(header)
-			// time.Sleep(1 * time.Second)
+			logrus.Debugf("  Message Type %d (segments: %d size: %d)", header.MessageType, header.NumMessageSegments, header.MessageSize)
 
+			// possible metadata record types: 0, 2, 3, 5, 13, 15, 18
+			// possible standard record types: 1, 2, 31
 			switch header.MessageType {
-			case 0:
-				msg := make([]byte, header.MessageSize)
-				binary.Read(msgBuf, binary.BigEndian, &msg)
-			case 31:
-				m31 := msg31(msgBuf)
-				logrus.Tracef("%s (%3d) ɑ=%7.3f elv=%2d tilt=%5f status=%d", m31.Header.RadarIdentifier, m31.Header.AzimuthNumber, m31.Header.AzimuthAngle, m31.Header.ElevationNumber, m31.Header.ElevationAngle, m31.Header.RadialStatus)
-
-				// if m31.Header.ElevationNumber > 1 {
-				// 	return &ar2
-				// }
-				ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
-				// return &ar2
-				if m31.VelocityData != nil {
-					// logrus.Warn("VelocityData")
-				}
 			case 2:
 				m2 := Message2{}
-				binary.Read(msgBuf, binary.BigEndian, &m2)
-				// eat the rest of the record since we know it's 2432 bytes
-				msg := make([]byte, 2432-16-54-12)
-				binary.Read(msgBuf, binary.BigEndian, &msg)
-				// spew.Dump(m2, msg)
-			// case 15:
-			// 	msg := make([]byte, header.MessageSize)
-			// 	binary.Read(msgBuf, binary.BigEndian, &msg)
-			// 	spew.Dump(msg)
+				binary.Read(bzipReader, binary.BigEndian, &m2)
+				logrus.Tracef("    status=%d op-status=%d vcp=%d build=%.2f",
+					m2.RDAStatus,
+					m2.OperabilityStatus,
+					m2.VolumeCoveragePatternNum,
+					float32(m2.RDABuild/100),
+				)
+			case 31:
+				m31 := msg31(bzipReader)
+				if m31.Header.AzimuthAngle > 359 || m31.Header.AzimuthAngle < 1 {
+					logrus.Tracef("    az=%3d ɑ=%7.3f elv=%2d tilt=%5f status=%d",
+						m31.Header.AzimuthNumber,
+						m31.Header.AzimuthAngle,
+						m31.Header.ElevationNumber,
+						m31.Header.ElevationAngle,
+						m31.Header.RadialStatus,
+					)
+				}
+
+				ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
 			default:
-				msg := make([]byte, header.MessageSize)
-				binary.Read(msgBuf, binary.BigEndian, &msg)
+				// skip the rest - which we know is DEFAULT - CTM - header
+				skip := make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16)
+				bzipReader.Read(skip)
 			}
 		}
 	}
 	return &ar2
 }
 
-func preview(r io.ReadSeeker, n int) {
-	preview := make([]byte, n)
-	binary.Read(r, binary.BigEndian, &preview)
-	spew.Dump(preview)
-	r.Seek(-int64(n), io.SeekCurrent)
-}
-
-func decompress(f io.Reader, size int32) *bytes.Reader {
-	start := time.Now()
-	defer func() {
-		logrus.Tracef("bz2 extract: %s", time.Since(start))
-	}()
-	compressedData := make([]byte, size)
-	binary.Read(f, binary.BigEndian, &compressedData)
-	bz2Reader := bzip2.NewReader(bytes.NewReader(compressedData))
-	extractedData := bytes.NewBuffer([]byte{})
-	io.Copy(extractedData, bz2Reader)
-	return bytes.NewReader(extractedData.Bytes())
-}
-
-func msg31(r *bytes.Reader) *Message31 {
+func msg31(r io.Reader) *Message31 {
 	m31h := Message31Header{}
 	binary.Read(r, binary.BigEndian, &m31h)
 
@@ -150,13 +128,11 @@ func msg31(r *bytes.Reader) *Message31 {
 	}
 
 	for i := uint16(0); i < m31h.DataBlockCount; i++ {
+
 		d := DataBlock{}
 		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
 			logrus.Panic(err.Error())
 		}
-
-		// rewind
-		r.Seek(-4, io.SeekCurrent)
 
 		blockName := string(d.DataName[:])
 		switch blockName {
@@ -177,6 +153,8 @@ func msg31(r *bytes.Reader) *Message31 {
 		case "PHI":
 			fallthrough
 		case "RHO":
+			fallthrough
+		case "CFP":
 			m := GenericDataMoment{}
 			binary.Read(r, binary.BigEndian, &m)
 
@@ -206,6 +184,8 @@ func msg31(r *bytes.Reader) *Message31 {
 				m31.PhiData = d
 			case "RHO":
 				m31.RhoData = d
+			case "CFP":
+				m31.CfpData = d
 			}
 		default:
 			logrus.Panicf("Data Block - unknown type '%s'", blockName)

@@ -10,7 +10,11 @@ const (
 	radialStatusEndOfVolumeScan        = 4
 	radialStatusStartNewElevation      = 5
 
-	LegacyCTMHeaderLen = 12
+	// LegacyCTMHeaderLength sits in front of every message header
+	LegacyCTMHeaderLength = 12
+
+	// DefaultMetadataRecordLength is the size of every record regardless of its contents
+	DefaultMetadataRecordLength = 2432
 )
 
 // VolumeHeaderRecord for NEXRAD Archive II Data Streams
@@ -40,23 +44,20 @@ const (
 // Version 06: Super Resolution (RDA Build 12.0 and later)
 // Version 07: Recombined Super Resolution (RDA Build 12.0 and later)
 type VolumeHeaderRecord struct {
-	X_FileName [12]byte
-	// ModifiedJulianDate NEXRAD date since 1970/1/1 = 1
-	X_ModifiedJulianDate int32
-	// X_ModifiedTime  ms since midnight
-	X_ModifiedTime int32
-	// ICAO Radar identifier in ASCII. The four uppercase character International Civil Aviation Organization identifier of the radar producing the data.
-	ICAO [4]byte
+	Filename     [12]byte
+	ModifiedDate int32   // ModifiedJulianDate NEXRAD date since 1970/1/1 = 1
+	ModifiedTime int32   // X_ModifiedTime  ms since midnight
+	ICAO         [4]byte // ICAO Radar identifier in ASCII. The four uppercase character International Civil Aviation Organization identifier of the radar producing the data.
 }
 
 // Date returns a time type representing the date of the scan capture
 func (vh VolumeHeaderRecord) Date() time.Time {
-	return timeFromModifiedJulian(int(vh.X_ModifiedJulianDate), int(vh.X_ModifiedTime))
+	return timeFromModifiedJulian(int(vh.ModifiedDate), int(vh.ModifiedTime))
 }
 
 // FileName returns the name of the File
 func (vh VolumeHeaderRecord) FileName() string {
-	return string(vh.X_FileName[:])
+	return string(vh.Filename[:])
 }
 
 func timeFromModifiedJulian(days, ms int) time.Time {
@@ -105,6 +106,7 @@ type Message31 struct {
 	ZdrData          *DataMoment
 	PhiData          *DataMoment
 	RhoData          *DataMoment
+	CfpData          *DataMoment
 }
 
 // Message2 contains RDA Status information about the radar site.
@@ -136,40 +138,28 @@ type Message2 struct {
 	RMSControlStatus                uint16
 	PerformanceCheckStatus          uint16
 	AlarmCodes                      uint16
+	Spares                          [20]byte
 }
 
 // Message31Header contains header information for an Archive 2 Message 31 type
 type Message31Header struct {
-	RadarIdentifier [4]byte
-	// CollectionTime Radial data collection time in milliseconds past midnight GMT
-	CollectionTime uint32
-	// ModifiedJulianDate Current Julian date - 2440586.5
-	ModifiedJulianDate uint16
-	// AzimuthNumber Radial number within elevation scan
-	AzimuthNumber uint16
-	// AzimuthAngle Azimuth angle at which radial data was collected
-	AzimuthAngle float32
-	// CompressionIndicator Indicates if message type 31 is compressed and what method of compression is used. The Data Header Block is not compressed.
-	CompressionIndicator uint8
-	Spare                uint8
-	// RadialLength Uncompressed length of the radial in bytes including the Data Header block length
-	RadialLength uint16
-	// AzimuthResolutionSpacing Code for the Azimuthal spacing between adjacent radials. 1 = .5 degrees, 2 = 1degree
-	AzimuthResolutionSpacingCode uint8
-	// RadialStatus Radial Status
-	RadialStatus uint8
-	// ElevationNumber Elevation number within volume scan
-	ElevationNumber uint8
-	// CutSectorNumber Sector Number within cut
-	CutSectorNumber uint8
-	// ElevationAngle Elevation angle at which radial radar data was collected
-	ElevationAngle float32
-	// RadialSpotBlankingStatus Spot blanking status for current radial, elevation scan and volume scan
-	RadialSpotBlankingStatus uint8
-	// AzimuthIndexingMode Azimuth indexing value (Set if azimuth angle is keyed to constant angles)
-	AzimuthIndexingMode uint8
-	DataBlockCount      uint16
-	DataBlockPointers   [9]uint32
+	RadarIdentifier              [4]byte
+	CollectionTime               uint32  // CollectionTime Radial data collection time in milliseconds past midnight GMT
+	ModifiedJulianDate           uint16  // ModifiedJulianDate Current Julian date - 2440586.5
+	AzimuthNumber                uint16  // AzimuthNumber Radial number within elevation scan
+	AzimuthAngle                 float32 // AzimuthAngle Azimuth angle at which radial data was collected
+	CompressionIndicator         uint8   // CompressionIndicator Indicates if message type 31 is compressed and what method of compression is used. The Data Header Block is not compressed.
+	Spare                        uint8
+	RadialLength                 uint16  // RadialLength Uncompressed length of the radial in bytes including the Data Header block length
+	AzimuthResolutionSpacingCode uint8   // AzimuthResolutionSpacing Code for the Azimuthal spacing between adjacent radials. 1 = .5 degrees, 2 = 1degree
+	RadialStatus                 uint8   // RadialStatus Radial Status
+	ElevationNumber              uint8   // ElevationNumber Elevation number within volume scan
+	CutSectorNumber              uint8   // CutSectorNumber Sector Number within cut
+	ElevationAngle               float32 // ElevationAngle Elevation angle at which radial radar data was collected
+	RadialSpotBlankingStatus     uint8   // RadialSpotBlankingStatus Spot blanking status for current radial, elevation scan and volume scan
+	AzimuthIndexingMode          uint8   // AzimuthIndexingMode Azimuth indexing value (Set if azimuth angle is keyed to constant angles)
+	DataBlockCount               uint16
+	DataBlockPointers            [10]uint32
 }
 
 // AzimuthResolutionSpacing returns the spacing in degrees according to the AzimuthResolutionSpacingCode
@@ -188,9 +178,7 @@ type DataBlock struct {
 
 // VolumeData wraps information about the Volume being extracted
 type VolumeData struct {
-	DataBlock
-	// LRTUP Size of data block in bytes
-	LRTUP                          uint16
+	LRTUP                          uint16 // LRTUP Size of data block in bytes
 	VersionMajor                   uint8
 	VersionMinor                   uint8
 	Lat                            float32
@@ -208,22 +196,15 @@ type VolumeData struct {
 
 // ElevationData wraps Message 31 elevation data
 type ElevationData struct {
-	DataBlock
-	// LRTUP Size of data block in bytes
-	LRTUP uint16
-	// ATMOS Atmospheric Attenuation Factor
-	ATMOS [2]byte
-	// CalibConst Scaling constant used by the Signal Processor for this elevation to calculate reflectivity
-	CalibConst float32
+	LRTUP      uint16  // LRTUP Size of data block in bytes
+	ATMOS      [2]byte // ATMOS Atmospheric Attenuation Factor
+	CalibConst float32 // CalibConst Scaling constant used by the Signal Processor for this elevation to calculate reflectivity
 }
 
 // RadialData wraps Message 31 radial data
 type RadialData struct {
-	DataBlock
-	// LRTUP Size of data block in bytes
-	LRTUP uint16
-	// UnambiguousRange, Interval Size
-	UnambiguousRange   uint16
+	LRTUP              uint16 // LRTUP Size of data block in bytes
+	UnambiguousRange   uint16 // UnambiguousRange, Interval Size
 	NoiseLevelHorz     float32
 	NoiseLevelVert     float32
 	NyquistVelocity    uint16
@@ -234,26 +215,16 @@ type RadialData struct {
 
 // GenericDataMoment is a generic data wrapper for momentary data. ex: REF, VEL, SW data
 type GenericDataMoment struct {
-	DataBlock
-	Reserved uint32
-	// NumberDataMomentGates Number of data moment gates for current radial
-	NumberDataMomentGates uint16
-	// DataMomentRange Range to center of first range gate
-	DataMomentRange uint16
-	// DataMomentRangeSampleInterval Size of data moment sample interval
-	DataMomentRangeSampleInterval uint16
-	// TOVER Threshold parameter which specifies the minimum difference in echo power between two resolution gates for them not to be labeled "overlayed"
-	TOVER uint16
-	// SNRThreshold SNR threshold for valid data
-	SNRThreshold uint16
-	// ControlFlags Indicates special control features
-	ControlFlags uint8
-	// DataWordSize Number of bits (DWS) used for storing data for each Data Moment gate
-	DataWordSize uint8
-	// Scale value used to convert Data Moments from integer to floating point data
-	Scale float32
-	// Offset value used to convert Data Moments from integer to floating point data
-	Offset float32
+	Reserved                      uint32
+	NumberDataMomentGates         uint16  // NumberDataMomentGates Number of data moment gates for current radial
+	DataMomentRange               uint16  // DataMomentRange Range to center of first range gate
+	DataMomentRangeSampleInterval uint16  // DataMomentRangeSampleInterval Size of data moment sample interval
+	TOVER                         uint16  // TOVER Threshold parameter which specifies the minimum difference in echo power between two resolution gates for them not to be labeled "overlayed"
+	SNRThreshold                  uint16  // SNRThreshold SNR threshold for valid data
+	ControlFlags                  uint8   // ControlFlags Indicates special control features
+	DataWordSize                  uint8   // DataWordSize Number of bits (DWS) used for storing data for each Data Moment gate
+	Scale                         float32 // Scale value used to convert Data Moments from integer to floating point data
+	Offset                        float32 // Offset value used to convert Data Moments from integer to floating point data
 }
 
 // DataMoment wraps all Momentary data records. ex: REF, VEL, SW data
@@ -262,7 +233,10 @@ type DataMoment struct {
 	Data []byte
 }
 
+// MomentDataBelowThreshold ...
 const MomentDataBelowThreshold = 999
+
+// MomentDataFolded ...
 const MomentDataFolded = 998
 
 // ScaledData automatically scales the nexrad moment values to their actual values.
