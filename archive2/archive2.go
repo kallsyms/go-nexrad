@@ -34,7 +34,7 @@ func NewArchive2(filename string) *Archive2 {
 
 	// read in the volume header record
 	binary.Read(file, binary.BigEndian, &ar2.VolumeHeader)
-	logrus.Debug(ar2.VolumeHeader.FileName())
+	logrus.Info(ar2.VolumeHeader.Filename())
 
 	// ------------------------------ LDM Records ------------------------------
 
@@ -53,7 +53,7 @@ func NewArchive2(filename string) *Archive2 {
 			if err != io.EOF {
 				logrus.Panic(err.Error())
 			}
-			return nil
+			return &ar2
 		}
 
 		// As the control word contains a negative size under some circumstances,
@@ -98,17 +98,20 @@ func NewArchive2(filename string) *Archive2 {
 				)
 			case 31:
 				m31 := msg31(bzipReader)
-				if m31.Header.AzimuthAngle > 359 || m31.Header.AzimuthAngle < 1 {
-					logrus.Tracef("    az=%3d ɑ=%7.3f elv=%2d tilt=%5f status=%d",
-						m31.Header.AzimuthNumber,
-						m31.Header.AzimuthAngle,
-						m31.Header.ElevationNumber,
-						m31.Header.ElevationAngle,
-						m31.Header.RadialStatus,
+
+				if m31.AzimuthAngle > 140 && m31.AzimuthAngle < 150 {
+					logrus.Tracef("    az=%3d ɑ=%7.3f elv=%2d tilt=%5f status=%d data=(%d gates) %v",
+						m31.AzimuthNumber,
+						m31.AzimuthAngle,
+						m31.ElevationNumber,
+						m31.ElevationAngle,
+						m31.RadialStatus,
+						m31.ReflectivityData.NumberDataMomentGates,
+						m31.ReflectivityData.ScaledData()[0:25],
 					)
 				}
 
-				ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
+				ar2.ElevationScans[int(m31.ElevationNumber)] = append(ar2.ElevationScans[int(m31.ElevationNumber)], m31)
 			default:
 				// skip the rest - which we know is DEFAULT - CTM - header
 				skip := make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16)
@@ -120,14 +123,10 @@ func NewArchive2(filename string) *Archive2 {
 }
 
 func msg31(r io.Reader) *Message31 {
-	m31h := Message31Header{}
-	binary.Read(r, binary.BigEndian, &m31h)
+	m31 := Message31{}
+	binary.Read(r, binary.BigEndian, &m31)
 
-	m31 := Message31{
-		Header: m31h,
-	}
-
-	for i := uint16(0); i < m31h.DataBlockCount; i++ {
+	for i := uint16(0); i < m31.DataBlockCount; i++ {
 
 		d := DataBlock{}
 		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
