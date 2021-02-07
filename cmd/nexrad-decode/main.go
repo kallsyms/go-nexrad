@@ -41,6 +41,6 @@ func main() {
 	defer pprof.StopCPUProfile()
 
 	// decode it
-	logrus.Info(color.CyanString("decoding ", cli.Args.Filename))
+	logrus.Infof("decoding %v", color.CyanString(cli.Args.Filename))
 	archive2.NewArchive2(cli.Args.Filename)
 }

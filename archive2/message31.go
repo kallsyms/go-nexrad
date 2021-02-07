@@ -7,8 +7,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Message31 - Digital Radar Data Generic Format (User 3.2.4.17)
-type Message31 struct {
+// Message31Header is the non-data portions of Message31 (User 3.2.4.17)
+type Message31Header struct {
 	RadarIdentifier              [4]byte // ICAO (eg KMPX for Minneapolis)
 	CollectionTime               uint32  // CollectionTime Radial data collection time in milliseconds past midnight GMT
 	ModifiedJulianDate           uint16  // ModifiedJulianDate Current Julian date - 2440586.5
@@ -26,24 +26,30 @@ type Message31 struct {
 	AzimuthIndexingMode          uint8   // AzimuthIndexingMode Azimuth indexing value (Set if azimuth angle is keyed to constant angles)
 	DataBlockCount               uint16
 	DataBlockPointers            [10]uint32
-	VolumeData                   VolumeData
-	ElevationData                ElevationData
-	RadialData                   RadialData
-	ReflectivityData             *DataMoment // only one of these will be used
-	VelocityData                 *DataMoment // only one of these will be used
-	SwData                       *DataMoment // only one of these will be used
-	ZdrData                      *DataMoment // only one of these will be used
-	PhiData                      *DataMoment // only one of these will be used
-	RhoData                      *DataMoment // only one of these will be used
-	CfpData                      *DataMoment // only one of these will be used
+}
+
+// Message31 - Digital Radar Data Generic Format (User 3.2.4.17)
+type Message31 struct {
+	Header        Message31Header
+	VolumeData    VolumeData
+	ElevationData ElevationData
+	RadialData    RadialData
+	Data          DataMoment
 }
 
 // NewMessage31 from the provided io.Reader
 func NewMessage31(r io.Reader) *Message31 {
-	m31 := Message31{}
-	binary.Read(r, binary.BigEndian, &m31)
+	header := Message31Header{}
+	err := binary.Read(r, binary.BigEndian, &header)
+	if err != nil {
+		logrus.Panic(err)
+	}
 
-	for i := uint16(0); i < m31.DataBlockCount; i++ {
+	m31 := Message31{
+		Header: header,
+	}
+
+	for i := uint16(0); i < header.DataBlockCount; i++ {
 
 		d := DataBlock{}
 		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
@@ -58,36 +64,18 @@ func NewMessage31(r io.Reader) *Message31 {
 			binary.Read(r, binary.BigEndian, &m31.ElevationData)
 		case "RAD":
 			binary.Read(r, binary.BigEndian, &m31.RadialData)
-		case "REF", "VEL", "SW", "ZDR", "PHI", "RHO", "CFP":
+		case "REF", "VEL", "SW ", "ZDR", "PHI", "RHO", "CFP":
 			m := GenericDataMoment{}
 			binary.Read(r, binary.BigEndian, &m)
 
-			// the data moment variable length is determined with (num gates * word size) / 8.
+			// the data moment length is determined with (num gates * word size) / 8.
 			dataMomentSize := m.NumberDataMomentGates * uint16(m.DataWordSize) / 8
 			data := make([]uint8, dataMomentSize)
 			binary.Read(r, binary.BigEndian, &data)
 
-			d := &DataMoment{
+			m31.Data = DataMoment{
 				GenericDataMoment: m,
 				Data:              data,
-			}
-
-			// drop it into the correct slot
-			switch blockName {
-			case "REF":
-				m31.ReflectivityData = d
-			case "VEL":
-				m31.VelocityData = d
-			case "SW ":
-				m31.SwData = d
-			case "ZDR":
-				m31.ZdrData = d
-			case "PHI":
-				m31.PhiData = d
-			case "RHO":
-				m31.RhoData = d
-			case "CFP":
-				m31.CfpData = d
 			}
 		default:
 			logrus.Panicf("Data Block - unknown type '%s'", blockName)
@@ -98,7 +86,7 @@ func NewMessage31(r io.Reader) *Message31 {
 
 // AzimuthResolutionSpacing returns the spacing in degrees
 func (h *Message31) AzimuthResolutionSpacing() float64 {
-	if h.AzimuthResolutionSpacingCode == 1 {
+	if h.Header.AzimuthResolutionSpacingCode == 1 {
 		return 0.5
 	}
 	return 1

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/fatih/color"
 	"github.com/sirupsen/logrus"
 )
 
@@ -61,7 +62,7 @@ func NewArchive2(filename string) *Archive2 {
 			ldm.Size = -ldm.Size
 		}
 
-		logrus.Debugf("LDM Compressed Record (%d bytes)", ldm.Size)
+		logrus.Debugf("LDM Compressed Record (%s bytes)", color.CyanString("%d", ldm.Size))
 
 		var compressedRecord = make([]byte, ldm.Size)
 		file.Read(compressedRecord)
@@ -93,26 +94,33 @@ func NewArchive2(filename string) *Archive2 {
 			case 2:
 				m2 := Message2{}
 				binary.Read(bzipReader, binary.BigEndian, &m2)
-				logrus.Tracef("    status=%d op-status=%d vcp=%d build=%.2f",
-					m2.RDAStatus,
-					m2.OperabilityStatus,
+
+				logrus.Infof("status=%s op-status=%s vcp=%d build=%.2f",
+					m2.GetRDAStatus(),
+					m2.GetOperabilityStatus(),
 					m2.VolumeCoveragePatternNum,
-					float32(m2.RDABuild/100),
+					m2.GetBuildNumber(),
 				)
+
+				if m2.GetBuildNumber() < 19 {
+					logrus.Fatalf("This file is build %.2f. Only build 19.00 is well supported. Try a more recent file.", m2.GetBuildNumber())
+				}
+
+				// skip the rest
+				bzipReader.Read(make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16-68))
 			case 31:
 				m31 := NewMessage31(bzipReader)
 
-				if m31.AzimuthAngle > 140 && m31.AzimuthAngle < 150 {
-					logrus.Tracef("    deg=%7.3f elv=%2d tilt=%5f data=(%d gates) %v",
-						m31.AzimuthAngle,
-						m31.ElevationNumber,
-						m31.ElevationAngle,
-						m31.ReflectivityData.NumberDataMomentGates,
-						m31.ReflectivityData.ScaledData()[0:25],
-					)
-				}
+				// instead of having every message dump data out, we'll just look at the 0-1 degree data
+				logrus.Tracef("    deg=%7.3f elv=%2d tilt=%5f data=(%d gates) %v...",
+					m31.Header.AzimuthAngle,
+					m31.Header.ElevationNumber,
+					m31.Header.ElevationAngle,
+					m31.Data.NumberDataMomentGates,
+					m31.Data.Data[0:10],
+				)
 
-				ar2.ElevationScans[int(m31.ElevationNumber)] = append(ar2.ElevationScans[int(m31.ElevationNumber)], m31)
+				ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
 			default:
 				// not handled, skip the rest - which we know is DEFAULT - CTM - header
 				skip := make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16)
