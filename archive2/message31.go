@@ -2,16 +2,25 @@ package archive2
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
+	"time"
 
 	"github.com/sirupsen/logrus"
+)
+
+var (
+	pointersPerBuild = map[float32]int{
+		18: 9,
+		19: 10,
+	}
 )
 
 // Message31Header is the non-data portions of Message31 (User 3.2.4.17)
 type Message31Header struct {
 	RadarIdentifier              [4]byte // ICAO (eg KMPX for Minneapolis)
 	CollectionTime               uint32  // CollectionTime Radial data collection time in milliseconds past midnight GMT
-	ModifiedJulianDate           uint16  // ModifiedJulianDate Current Julian date - 2440586.5
+	CollectionDate               uint16  // CollectionDate Current Julian date - 2440586.5
 	AzimuthNumber                uint16  // AzimuthNumber Radial number within elevation scan
 	AzimuthAngle                 float32 // AzimuthAngle Azimuth angle at which radial data was collected
 	CompressionIndicator         uint8   // CompressionIndicator Indicates if message type 31 is compressed and what method of compression is used. The Data Header Block is not compressed.
@@ -24,8 +33,24 @@ type Message31Header struct {
 	ElevationAngle               float32 // ElevationAngle Elevation angle at which radial radar data was collected
 	RadialSpotBlankingStatus     uint8   // RadialSpotBlankingStatus Spot blanking status for current radial, elevation scan and volume scan
 	AzimuthIndexingMode          uint8   // AzimuthIndexingMode Azimuth indexing value (Set if azimuth angle is keyed to constant angles)
-	DataBlockCount               uint16
-	DataBlockPointers            [10]uint32
+	DataBlockCount               uint16  // Number of data blocks used
+	// normally this would be the data block pointers, but we dont actually use this
+}
+
+func (h Message31Header) String() string {
+	return fmt.Sprintf("Message 31 - %s @ %v deg=%.2f tilt=%.2f",
+		string(h.RadarIdentifier[:]),
+		h.Date(),
+		h.AzimuthAngle,
+		h.ElevationAngle,
+	)
+}
+
+// Date and time this data is valid for
+func (h Message31Header) Date() time.Time {
+	return time.Date(1970, time.January, 1, 0, 0, 0, 0, time.UTC).
+		Add(time.Duration(h.CollectionDate) * time.Hour * 24).
+		Add(time.Duration(h.CollectionTime) * time.Millisecond)
 }
 
 // Message31 - Digital Radar Data Generic Format (User 3.2.4.17)
@@ -34,16 +59,22 @@ type Message31 struct {
 	VolumeData    VolumeData
 	ElevationData ElevationData
 	RadialData    RadialData
-	Data          DataMoment
+	REFData       DataMoment
+	VELData       DataMoment
+	SWData        DataMoment
+	ZDRData       DataMoment
+	PHIData       DataMoment
+	RHOData       DataMoment
+	CFPData       DataMoment
 }
 
 // NewMessage31 from the provided io.Reader
-func NewMessage31(r io.Reader) *Message31 {
+func NewMessage31(r io.Reader, build float32) *Message31 {
 	header := Message31Header{}
-	err := binary.Read(r, binary.BigEndian, &header)
-	if err != nil {
-		logrus.Panic(err)
-	}
+	binary.Read(r, binary.BigEndian, &header)
+
+	// skip over the data block pointers, which is build dependent
+	binary.Read(r, binary.BigEndian, make([]uint32, pointersPerBuild[build]))
 
 	m31 := Message31{
 		Header: header,
@@ -73,11 +104,29 @@ func NewMessage31(r io.Reader) *Message31 {
 			data := make([]uint8, dataMomentSize)
 			binary.Read(r, binary.BigEndian, &data)
 
-			m31.Data = DataMoment{
+			moment := DataMoment{
 				GenericDataMoment: m,
 				Data:              data,
 			}
+
+			switch blockName {
+			case "REF":
+				m31.REFData = moment
+			case "VEL":
+				m31.VELData = moment
+			case "SW ":
+				m31.SWData = moment
+			case "ZDR":
+				m31.ZDRData = moment
+			case "PHI":
+				m31.PHIData = moment
+			case "RHO":
+				m31.RHOData = moment
+			case "CFP":
+				m31.CFPData = moment
+			}
 		default:
+			logrus.Error(header)
 			logrus.Panicf("Data Block - unknown type '%s'", blockName)
 		}
 	}

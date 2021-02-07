@@ -1,6 +1,10 @@
 package archive2
 
-import "github.com/sirupsen/logrus"
+import (
+	"fmt"
+
+	"github.com/sirupsen/logrus"
+)
 
 // Message2 RDA Status Data (User 3.2.4.6)
 type Message2 struct {
@@ -31,8 +35,16 @@ type Message2 struct {
 	RMSControlStatus                uint16
 	PerformanceCheckStatus          uint16
 	AlarmCodes                      uint16
-	SignalProcessingOptions         uint16
-	Spares                          [12]byte
+	Spares                          [14]byte
+}
+
+func (m2 Message2) String() string {
+	return fmt.Sprintf("Message 2 - %s and %s. VCP %d build %.2f",
+		m2.GetRDAStatus(),
+		m2.GetOperabilityStatus(),
+		m2.VolumeCoveragePatternNum,
+		m2.GetBuildNumber(),
+	)
 }
 
 // GetRDAStatus returns a human friendly status

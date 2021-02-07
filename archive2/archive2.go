@@ -41,7 +41,13 @@ func NewArchive2(filename string) *Archive2 {
 	binary.Read(file, binary.BigEndian, &ar2.VolumeHeader)
 	logrus.Info(ar2.VolumeHeader.Filename())
 
+	// the metadata record will contain a single Message Type 2 which comes in handy
+	// in other parts of the decoding for version-specific handling.
+	var metadataStatusMessage *Message2
+
 	// read until no more LDM records are available
+	LDMCount := 0
+	messageCount := 0
 	for true {
 		ldm := LDMRecord{}
 
@@ -50,7 +56,7 @@ func NewArchive2(filename string) *Archive2 {
 		if err != nil {
 			// all done if EOF
 			if err == io.EOF {
-				return &ar2
+				break
 			}
 
 			// un oh, something unexpected
@@ -73,6 +79,10 @@ func NewArchive2(filename string) *Archive2 {
 		// bzipReader, _ := bzip2.NewReader(bytes.NewReader(compressedRecord), nil)
 
 		// read until no more messages are available
+		messageCounts := map[uint8]int{
+			2:  0,
+			31: 0,
+		}
 		for true {
 
 			// eat 12 bytes due to legacy compliance of CTM Header, these are all set to nil
@@ -87,38 +97,35 @@ func NewArchive2(filename string) *Archive2 {
 				break
 			}
 
-			logrus.Debugf("  Message Type %d (segments: %d size: %d)", header.MessageType, header.NumMessageSegments, header.MessageSize)
+			logrus.Tracef("  Message Type %d (segments: %d size: %d)", header.MessageType, header.NumMessageSegments, header.MessageSize)
 
 			// anything not called out in the switch falls into the default (and is skipped)
 			switch header.MessageType {
 			case 2:
+				// we'll keep the first one - it should be the metadata record's
 				m2 := Message2{}
 				binary.Read(bzipReader, binary.BigEndian, &m2)
+				logrus.Info(m2)
 
-				logrus.Infof("status=%s op-status=%s vcp=%d build=%.2f",
-					m2.GetRDAStatus(),
-					m2.GetOperabilityStatus(),
-					m2.VolumeCoveragePatternNum,
-					m2.GetBuildNumber(),
-				)
-
-				if m2.GetBuildNumber() < 19 {
+				if m2.GetBuildNumber() < 18 {
 					logrus.Fatalf("This file is build %.2f. Only build 19.00 is well supported. Try a more recent file.", m2.GetBuildNumber())
 				}
 
 				// skip the rest
 				bzipReader.Read(make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16-68))
+
+				// keep a reference around
+				if metadataStatusMessage == nil {
+					metadataStatusMessage = &m2
+				}
+
 			case 31:
-				m31 := NewMessage31(bzipReader)
+				m31 := NewMessage31(bzipReader, metadataStatusMessage.GetBuildNumber())
 
 				// instead of having every message dump data out, we'll just look at the 0-1 degree data
-				logrus.Tracef("    deg=%7.3f elv=%2d tilt=%5f data=(%d gates) %v...",
-					m31.Header.AzimuthAngle,
-					m31.Header.ElevationNumber,
-					m31.Header.ElevationAngle,
-					m31.Data.NumberDataMomentGates,
-					m31.Data.Data[0:10],
-				)
+				if m31.Header.AzimuthAngle < 1 {
+					logrus.Trace(m31)
+				}
 
 				ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
 			default:
@@ -126,7 +133,33 @@ func NewArchive2(filename string) *Archive2 {
 				skip := make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16)
 				bzipReader.Read(skip)
 			}
+
+			messageCount++
+
+			if _, ok := messageCounts[header.MessageType]; ok {
+				messageCounts[header.MessageType]++
+			} else {
+				messageCounts[header.MessageType] = 1
+			}
 		}
+
+		// helpful for debugging
+		totalMessages := 0
+		for _, count := range messageCounts {
+			totalMessages += count
+		}
+		logrus.Debugf("  found %s messages in this record", color.CyanString("%d", totalMessages))
+		for msgType, count := range messageCounts {
+			logrus.Debugf("    type %02d had %d messages", msgType, count)
+		}
+
+		LDMCount++
 	}
+
+	logrus.Infof("found %s messages in %s LDM records",
+		color.CyanString("%d", messageCount),
+		color.CyanString("%d", LDMCount),
+	)
+
 	return &ar2
 }

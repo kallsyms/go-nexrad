@@ -18,8 +18,8 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 
-	"github.com/bwiggs/go-nexrad/archive2"
 	"github.com/cheggaaa/pb/v3"
+	"github.com/jddeal/go-nexrad/archive2"
 	"github.com/llgcode/draw2d/draw2dimg"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -126,14 +126,7 @@ func animate(dir, outdir, prod string) {
 		go func(i int) {
 			for l2f := range source {
 				outf := fmt.Sprintf("%s/%s.png", outdir, l2f)
-				// fmt.Printf("Generating %s from %s -> %s\n", prod, l2f, outf)
-				f, err := os.Open(dir + "/" + l2f)
-				if err != nil {
-					logrus.Error(err)
-					return
-				}
-				ar2 := archive2.Extract(f)
-				f.Close()
+				ar2 := archive2.NewArchive2(dir + "/" + l2f)
 				elv := 1
 				if prod == "vel" {
 					elv = 2
@@ -160,14 +153,7 @@ func animate(dir, outdir, prod string) {
 func single(in, out, product string) {
 	fmt.Printf("Generating %s from %s -> %s\n", product, in, out)
 
-	f, err := os.Open(in)
-	defer f.Close()
-	if err != nil {
-		logrus.Error(err)
-		return
-	}
-
-	ar2 := archive2.Extract(f)
+	ar2 := archive2.NewArchive2(in)
 	elv := 1
 	if product == "vel" {
 		elv = 2 // uhhh, why did i do this again?
@@ -194,8 +180,8 @@ func render(out string, radials []*archive2.Message31, label string) {
 	xc := width / 2
 	yc := height / 2
 	pxPerKm := width / 2 / 460
-	firstGatePx := float64(radials[0].ReflectivityData.DataMomentRange) / 1000 * pxPerKm
-	gateIntervalKm := float64(radials[0].ReflectivityData.DataMomentRangeSampleInterval) / 1000
+	firstGatePx := float64(radials[0].REFData.DataMomentRange) / 1000 * pxPerKm
+	gateIntervalKm := float64(radials[0].REFData.DataMomentRangeSampleInterval) / 1000
 	gateWidthPx := gateIntervalKm * pxPerKm
 
 	for _, radial := range radials {
@@ -205,7 +191,7 @@ func render(out string, radials []*archive2.Message31, label string) {
 		if azimuthAngle < 0 {
 			azimuthAngle = 360.0 + azimuthAngle
 		}
-		azimuthSpacing := radial.Header.AzimuthResolutionSpacing()
+		azimuthSpacing := radial.AzimuthResolutionSpacing()
 		azimuth := math.Floor(azimuthAngle)
 		if math.Floor(azimuthAngle+azimuthSpacing) > azimuth {
 			azimuth += azimuthSpacing
@@ -220,10 +206,11 @@ func render(out string, radials []*archive2.Message31, label string) {
 
 		var gates []float32
 		switch product {
+		case "ref":
+			gates = radial.REFData.ScaledData()
 		case "vel":
-			gates = radial.VelocityData.ScaledData()
-		default:
-			gates = radial.ReflectivityData.ScaledData()
+			gates = radial.VELData.ScaledData()
+
 		}
 
 		numGates := len(gates)
@@ -246,7 +233,7 @@ func render(out string, radials []*archive2.Message31, label string) {
 
 			distanceX += gateWidthPx
 			distanceY += gateWidthPx
-			azimuth += radial.Header.AzimuthResolutionSpacing()
+			azimuth += radial.AzimuthResolutionSpacing()
 		}
 	}
 
