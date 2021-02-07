@@ -1,5 +1,12 @@
 package archive2
 
+import (
+	"encoding/binary"
+	"io"
+
+	"github.com/sirupsen/logrus"
+)
+
 // Message31 - Digital Radar Data Generic Format (User 3.2.4.17)
 type Message31 struct {
 	RadarIdentifier              [4]byte // ICAO (eg KMPX for Minneapolis)
@@ -8,7 +15,7 @@ type Message31 struct {
 	AzimuthNumber                uint16  // AzimuthNumber Radial number within elevation scan
 	AzimuthAngle                 float32 // AzimuthAngle Azimuth angle at which radial data was collected
 	CompressionIndicator         uint8   // CompressionIndicator Indicates if message type 31 is compressed and what method of compression is used. The Data Header Block is not compressed.
-	Spare                        uint8
+	Spare                        uint8   // unused
 	RadialLength                 uint16  // RadialLength Uncompressed length of the radial in bytes including the Data Header block length
 	AzimuthResolutionSpacingCode uint8   // AzimuthResolutionSpacing Code for the Azimuthal spacing between adjacent radials. 1 = .5 degrees, 2 = 1degree
 	RadialStatus                 uint8   // RadialStatus Radial Status
@@ -22,13 +29,71 @@ type Message31 struct {
 	VolumeData                   VolumeData
 	ElevationData                ElevationData
 	RadialData                   RadialData
-	ReflectivityData             *DataMoment
-	VelocityData                 *DataMoment
-	SwData                       *DataMoment
-	ZdrData                      *DataMoment
-	PhiData                      *DataMoment
-	RhoData                      *DataMoment
-	CfpData                      *DataMoment
+	ReflectivityData             *DataMoment // only one of these will be used
+	VelocityData                 *DataMoment // only one of these will be used
+	SwData                       *DataMoment // only one of these will be used
+	ZdrData                      *DataMoment // only one of these will be used
+	PhiData                      *DataMoment // only one of these will be used
+	RhoData                      *DataMoment // only one of these will be used
+	CfpData                      *DataMoment // only one of these will be used
+}
+
+// NewMessage31 from the provided io.Reader
+func NewMessage31(r io.Reader) *Message31 {
+	m31 := Message31{}
+	binary.Read(r, binary.BigEndian, &m31)
+
+	for i := uint16(0); i < m31.DataBlockCount; i++ {
+
+		d := DataBlock{}
+		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
+			logrus.Panic(err.Error())
+		}
+
+		blockName := string(d.DataName[:])
+		switch blockName {
+		case "VOL":
+			binary.Read(r, binary.BigEndian, &m31.VolumeData)
+		case "ELV":
+			binary.Read(r, binary.BigEndian, &m31.ElevationData)
+		case "RAD":
+			binary.Read(r, binary.BigEndian, &m31.RadialData)
+		case "REF", "VEL", "SW", "ZDR", "PHI", "RHO", "CFP":
+			m := GenericDataMoment{}
+			binary.Read(r, binary.BigEndian, &m)
+
+			// the data moment variable length is determined with (num gates * word size) / 8.
+			dataMomentSize := m.NumberDataMomentGates * uint16(m.DataWordSize) / 8
+			data := make([]uint8, dataMomentSize)
+			binary.Read(r, binary.BigEndian, &data)
+
+			d := &DataMoment{
+				GenericDataMoment: m,
+				Data:              data,
+			}
+
+			// drop it into the correct slot
+			switch blockName {
+			case "REF":
+				m31.ReflectivityData = d
+			case "VEL":
+				m31.VelocityData = d
+			case "SW ":
+				m31.SwData = d
+			case "ZDR":
+				m31.ZdrData = d
+			case "PHI":
+				m31.PhiData = d
+			case "RHO":
+				m31.RhoData = d
+			case "CFP":
+				m31.CfpData = d
+			}
+		default:
+			logrus.Panicf("Data Block - unknown type '%s'", blockName)
+		}
+	}
+	return &m31
 }
 
 // AzimuthResolutionSpacing returns the spacing in degrees
@@ -39,15 +104,17 @@ func (h *Message31) AzimuthResolutionSpacing() float64 {
 	return 1
 }
 
-// DataBlock wraps Data Block information
+// DataBlock is sort of like the header for the blocks of data (GenericDataMoment, VolumeData, etc). These 4 bytes are
+// normally found at the top of tables XVII-[BEFH] (User 3.2.4.17)
 type DataBlock struct {
 	DataBlockType [1]byte
 	DataName      [3]byte
 }
 
-// GenericDataMoment is a generic data wrapper for momentary data. ex: REF, VEL, SW data
+// GenericDataMoment is a generic data wrapper for momentary data. ex: REF, VEL, SW data (User 3.2.4.17.2)
 type GenericDataMoment struct {
-	Reserved                      uint32
+	// data block type and data moment name are retrieved separately
+	Reserved                      uint32  //
 	NumberDataMomentGates         uint16  // NumberDataMomentGates Number of data moment gates for current radial
 	DataMomentRange               uint16  // DataMomentRange Range to center of first range gate
 	DataMomentRangeSampleInterval uint16  // DataMomentRangeSampleInterval Size of data moment sample interval
@@ -59,8 +126,9 @@ type GenericDataMoment struct {
 	Offset                        float32 // Offset value used to convert Data Moments from integer to floating point data
 }
 
-// VolumeData wraps information about the Volume being extracted
+// VolumeData wraps information about the Volume being extracted (User 3.2.4.17.3)
 type VolumeData struct {
+	// data block type and data moment name are retrieved separately
 	LRTUP                          uint16 // LRTUP Size of data block in bytes
 	VersionMajor                   uint8
 	VersionMinor                   uint8
@@ -77,15 +145,17 @@ type VolumeData struct {
 	ProcessingStatus               uint16
 }
 
-// ElevationData wraps Message 31 elevation data
+// ElevationData wraps Message 31 elevation data (User 3.2.4.17.4)
 type ElevationData struct {
+	// data block type and data moment name are retrieved separately
 	LRTUP      uint16  // LRTUP Size of data block in bytes
 	ATMOS      [2]byte // ATMOS Atmospheric Attenuation Factor
 	CalibConst float32 // CalibConst Scaling constant used by the Signal Processor for this elevation to calculate reflectivity
 }
 
-// RadialData wraps Message 31 radial data
+// RadialData wraps Message 31 radial data (User 3.2.4.17.5)
 type RadialData struct {
+	// data block type and data moment name are retrieved separately
 	LRTUP              uint16 // LRTUP Size of data block in bytes
 	UnambiguousRange   uint16 // UnambiguousRange, Interval Size
 	NoiseLevelHorz     float32
@@ -96,17 +166,19 @@ type RadialData struct {
 	CalibConstVertChan float32
 }
 
-// DataMoment wraps all Momentary data records. ex: REF, VEL, SW data
+// DataMoment wraps all Momentary data records. ex: REF, VEL, SW data. Data interpretation provided by User 3.2.4.17.6.
 type DataMoment struct {
 	GenericDataMoment
 	Data []byte
 }
 
-// MomentDataBelowThreshold ...
-const MomentDataBelowThreshold = 999
+const (
+	// MomentDataBelowThreshold ...
+	MomentDataBelowThreshold = 999
 
-// MomentDataFolded ...
-const MomentDataFolded = 998
+	// MomentDataFolded ...
+	MomentDataFolded = 998
+)
 
 // ScaledData automatically scales the nexrad moment values to their actual values.
 // For all data moment integer values N = 0 indicates received signal is below

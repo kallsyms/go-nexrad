@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime/pprof"
 
 	"github.com/fatih/color"
 	"github.com/jddeal/go-nexrad/archive2"
@@ -33,6 +34,11 @@ func main() {
 		"trace": logrus.TraceLevel,
 	}
 	logrus.SetLevel(errorLevels[cli.LogLevel])
+
+	// uncomment below to enable profiling, then run `go tool pprof out.prof` and `top10` in the pprof prompt
+	f, _ := os.Create("out.prof")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
 
 	// decode it
 	logrus.Info(color.CyanString("decoding ", cli.Args.Filename))

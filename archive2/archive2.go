@@ -30,35 +30,33 @@ func NewArchive2(filename string) *Archive2 {
 		logrus.Fatal(err)
 	}
 
-	// -------------------------- Volume Header Record -------------------------
+	// the gist of the file format is documented in RDA/RPG 7.3.6
+	// but in short:
+	//  - read in 24 byte Volume Header
+	//  - read in 1 LDM Compressed Record - this is the metadata record
+	//  - read in N LDM Compressed Records - these are the data records
 
 	// read in the volume header record
 	binary.Read(file, binary.BigEndian, &ar2.VolumeHeader)
 	logrus.Info(ar2.VolumeHeader.Filename())
 
-	// ------------------------------ LDM Records ------------------------------
-
-	// The first LDMRecord is the Metadata Record, consisting of 134 messages of
-	// Metadata message types 15, 13, 18, 3, 5, and 2
-
-	// Following the first LDM Metadata Record is a variable number of compressed
-	// records containing 120 radial messages (type 31) plus 0 or more RDA Status
-	// messages (type 2).
-
+	// read until no more LDM records are available
 	for true {
 		ldm := LDMRecord{}
 
-		// read in control word (size) of LDM record
-		if err := binary.Read(file, binary.BigEndian, &ldm.Size); err != nil {
-			if err != io.EOF {
-				logrus.Panic(err.Error())
+		// read in size of LDM record
+		err := binary.Read(file, binary.BigEndian, &ldm.Size)
+		if err != nil {
+			// all done if EOF
+			if err == io.EOF {
+				return &ar2
 			}
-			return &ar2
+
+			// un oh, something unexpected
+			logrus.Panic(err.Error())
 		}
 
-		// As the control word contains a negative size under some circumstances,
-		// the absolute value of the control word must be used for determining
-		// the size of the block.
+		// the size can be negative, but you just interpret it as positive (RDA/RPG 7.3.4)
 		if ldm.Size < 0 {
 			ldm.Size = -ldm.Size
 		}
@@ -66,14 +64,20 @@ func NewArchive2(filename string) *Archive2 {
 		logrus.Debugf("LDM Compressed Record (%d bytes)", ldm.Size)
 
 		var compressedRecord = make([]byte, ldm.Size)
-		binary.Read(file, binary.BigEndian, &compressedRecord)
+		file.Read(compressedRecord)
 		bzipReader := bzip2.NewReader(bytes.NewReader(compressedRecord))
 
+		// this uses the alternative bzip2 implementation from github.com/dsnet/compress/bzip2 but the improvement
+		// didn't seem substantial enough to add the dependency (~2.2s down to ~2.0s)
+		// bzipReader, _ := bzip2.NewReader(bytes.NewReader(compressedRecord), nil)
+
+		// read until no more messages are available
 		for true {
 
 			// eat 12 bytes due to legacy compliance of CTM Header, these are all set to nil
 			bzipReader.Read(make([]byte, 12))
 
+			// read in the rest of the header
 			header := MessageHeader{}
 			if err := binary.Read(bzipReader, binary.BigEndian, &header); err != nil {
 				if err != io.EOF {
@@ -84,8 +88,7 @@ func NewArchive2(filename string) *Archive2 {
 
 			logrus.Debugf("  Message Type %d (segments: %d size: %d)", header.MessageType, header.NumMessageSegments, header.MessageSize)
 
-			// possible metadata record types: 0, 2, 3, 5, 13, 15, 18
-			// possible standard record types: 1, 2, 31
+			// anything not called out in the switch falls into the default (and is skipped)
 			switch header.MessageType {
 			case 2:
 				m2 := Message2{}
@@ -97,15 +100,13 @@ func NewArchive2(filename string) *Archive2 {
 					float32(m2.RDABuild/100),
 				)
 			case 31:
-				m31 := msg31(bzipReader)
+				m31 := NewMessage31(bzipReader)
 
 				if m31.AzimuthAngle > 140 && m31.AzimuthAngle < 150 {
-					logrus.Tracef("    az=%3d ɑ=%7.3f elv=%2d tilt=%5f status=%d data=(%d gates) %v",
-						m31.AzimuthNumber,
+					logrus.Tracef("    deg=%7.3f elv=%2d tilt=%5f data=(%d gates) %v",
 						m31.AzimuthAngle,
 						m31.ElevationNumber,
 						m31.ElevationAngle,
-						m31.RadialStatus,
 						m31.ReflectivityData.NumberDataMomentGates,
 						m31.ReflectivityData.ScaledData()[0:25],
 					)
@@ -113,82 +114,11 @@ func NewArchive2(filename string) *Archive2 {
 
 				ar2.ElevationScans[int(m31.ElevationNumber)] = append(ar2.ElevationScans[int(m31.ElevationNumber)], m31)
 			default:
-				// skip the rest - which we know is DEFAULT - CTM - header
+				// not handled, skip the rest - which we know is DEFAULT - CTM - header
 				skip := make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16)
 				bzipReader.Read(skip)
 			}
 		}
 	}
 	return &ar2
-}
-
-func msg31(r io.Reader) *Message31 {
-	m31 := Message31{}
-	binary.Read(r, binary.BigEndian, &m31)
-
-	for i := uint16(0); i < m31.DataBlockCount; i++ {
-
-		d := DataBlock{}
-		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
-			logrus.Panic(err.Error())
-		}
-
-		blockName := string(d.DataName[:])
-		switch blockName {
-		case "VOL":
-			binary.Read(r, binary.BigEndian, &m31.VolumeData)
-		case "ELV":
-			binary.Read(r, binary.BigEndian, &m31.ElevationData)
-		case "RAD":
-			binary.Read(r, binary.BigEndian, &m31.RadialData)
-		case "REF":
-			fallthrough
-		case "VEL":
-			fallthrough
-		case "SW ":
-			fallthrough
-		case "ZDR":
-			fallthrough
-		case "PHI":
-			fallthrough
-		case "RHO":
-			fallthrough
-		case "CFP":
-			m := GenericDataMoment{}
-			binary.Read(r, binary.BigEndian, &m)
-
-			// LDM is the amount of space in bytes required for a data moment
-			// array and equals ((NG * DWS) / 8) where NG is the number of gates
-			// at the gate spacing resolution specified and DWS is the number of
-			// bits stored for each gate (DWS is always a multiple of 8).
-			ldm := m.NumberDataMomentGates * uint16(m.DataWordSize) / 8
-			data := make([]uint8, ldm)
-			binary.Read(r, binary.BigEndian, &data)
-
-			d := &DataMoment{
-				GenericDataMoment: m,
-				Data:              data,
-			}
-
-			switch blockName {
-			case "REF":
-				m31.ReflectivityData = d
-			case "VEL":
-				m31.VelocityData = d
-			case "SW ":
-				m31.SwData = d
-			case "ZDR":
-				m31.ZdrData = d
-			case "PHI":
-				m31.PhiData = d
-			case "RHO":
-				m31.RhoData = d
-			case "CFP":
-				m31.CfpData = d
-			}
-		default:
-			logrus.Panicf("Data Block - unknown type '%s'", blockName)
-		}
-	}
-	return &m31
 }
