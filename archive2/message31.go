@@ -134,7 +134,7 @@ func NewMessage31(r io.Reader, build float32) *Message31 {
 }
 
 // AzimuthResolutionSpacing returns the spacing in degrees
-func (h *Message31) AzimuthResolutionSpacing() float64 {
+func (h *Message31) AzimuthResolutionSpacing() float32 {
 	if h.Header.AzimuthResolutionSpacingCode == 1 {
 		return 0.5
 	}
