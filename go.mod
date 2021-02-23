@@ -6,6 +6,7 @@ require (
 	github.com/cheggaaa/pb/v3 v3.0.5
 	github.com/fatih/color v1.10.0
 	github.com/g3n/engine v0.1.1-0.20210127232258-6d0136f3444c
+	github.com/g3n/g3nd v0.1.0 // indirect
 	github.com/go-gl/gl v0.0.0-20180407155706-68e253793080
 	github.com/go-gl/glfw v0.0.0-20190409004039-e6da0acd62b1
 	github.com/jessevdk/go-flags v1.4.0
