@@ -7,10 +7,8 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
-	"io/ioutil"
 	"math"
 	"net/http"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -236,20 +234,20 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 	imageSize := 1000
 
 	renderImg := render(ar2.ElevationScans[elv], product, imageSize, "noaa")
-	asdf, _ := os.OpenFile("/tmp/r.png", os.O_WRONLY|os.O_CREATE, 0644)
-	png.Encode(asdf, renderImg)
-	asdf.Close()
+	// asdf, _ := os.OpenFile("/tmp/r.png", os.O_WRONLY|os.O_CREATE, 0644)
+	// png.Encode(asdf, renderImg)
+	// asdf.Close()
 
 	renderDSName := fmt.Sprintf(
-		"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte,PIXELOFFSET=0,LINEOFFSET=0,BANDOFFSET=0",
+		// PIXELOFFSET=4 since we have 4 bytes between the start of any given pixel (R,G,B,A)
+		// BANDOFFSET=1 means the value for a band is 1 byte after the prev band
+		"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte,PIXELOFFSET=4,BANDOFFSET=1",
 		&renderImg.Pix[0],
 		renderImg.Rect.Dx(),
 		renderImg.Rect.Dy(),
 	)
-	fmt.Println(renderDSName)
 
-	//renderDS, err := gdal.Open(renderDSName, gdal.ReadOnly)
-	renderDS, err := gdal.Open("/tmp/r.png", gdal.ReadOnly)
+	renderDS, err := gdal.Open(renderDSName, gdal.ReadOnly)
 	if err != nil {
 		fmt.Printf("GDAL Open renderDS err: %v\n", err)
 		return
@@ -285,26 +283,29 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 	pixStepM := distM * 2.0 / float64(imageSize)
 	renderDS.SetGeoTransform([6]float64{-distM, -pixStepM, 0, distM, 0, pixStepM})
 
+	// sanity check renderDS was loaded properly
+	// gdal.Translate("/tmp/o.png", renderDS, []string{})
+
 	warpedImg := image.NewRGBA(image.Rect(0, 0, 6000, 2600))
-	// warpedDSName := fmt.Sprintf(
-	// 	"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte",
-	// 	&warpedImg.Pix[0],
-	// 	warpedImg.Rect.Dx(),
-	// 	warpedImg.Rect.Dy(),
-	// )
+	warpedDSName := fmt.Sprintf(
+		"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte,PIXELOFFSET=4,BANDOFFSET=1",
+		&warpedImg.Pix[0],
+		warpedImg.Rect.Dx(),
+		warpedImg.Rect.Dy(),
+	)
 
-	// warpedDS, err := gdal.Open(warpedDSName, gdal.Update)
-	// if err != nil {
-	// 	fmt.Printf("GDAL Open warpedDS err: %v\n", err)
-	// 	return
-	// }
+	warpedDS, err := gdal.Open(warpedDSName, gdal.Update)
+	if err != nil {
+		fmt.Printf("GDAL Open warpedDS err: %v\n", err)
+		return
+	}
 
-	// defer warpedDS.Close()
+	defer warpedDS.Close()
 
-	// spatialRef := gdal.CreateSpatialReference("")
-	// spatialRef.FromEPSG(3857)
-	// srString, _ := spatialRef.ToWKT()
-	// warpedDS.SetProjection(srString)
+	spatialRef := gdal.CreateSpatialReference("")
+	spatialRef.FromEPSG(3857)
+	srString, _ := spatialRef.ToWKT()
+	warpedDS.SetProjection(srString)
 
 	// warpedDS.SetGeoTransform([6]float64{
 	// 	-125,  // upper-left x coord
@@ -315,25 +316,17 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 	// 	(50.0-25.0)/float64(warpedImg.Rect.Dy()),  // y pixel res
 	// })
 
-	// warpedDS.SetGeoTransform([6]float64{
-	// 	-20026376.39,
-	// 	40000000/float64(warpedImg.Rect.Dx()),
-	// 	0,
-	// 	-20048966.10,
-	// 	0,
-	// 	40000000/float64(warpedImg.Rect.Dx()),
-	// })
+	warpedDS.SetGeoTransform([6]float64{
+		-20026376.39,
+		40000000 / float64(warpedImg.Rect.Dx()),
+		0,
+		-20048966.10,
+		0,
+		40000000 / float64(warpedImg.Rect.Dy()),
+	})
 
-	// _, err = gdal.Warp("", &warpedDS, []gdal.Dataset{renderDS}, []string{
-	// 	"-srcalpha",
-	// 	"-dstalpha",
-	// })
-	_, err = gdal.Warp("/tmp/warped.tiff", nil, []gdal.Dataset{renderDS}, []string{
+	_, err = gdal.Warp("", &warpedDS, []gdal.Dataset{renderDS}, []string{
 		"-srcalpha",
-		"-t_srs", "EPSG:3857",
-		"-te", "-20026376.39", "-20048966.10", "20026376.39", "20048966.10",
-		//"-te", "-125", "25", "-65", "50",
-		"-ts", strconv.Itoa(warpedImg.Rect.Dx()), strconv.Itoa(warpedImg.Rect.Dy()),
 		"-dstalpha",
 	})
 	if err != nil {
@@ -341,9 +334,7 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	asdf, _ = os.OpenFile("/tmp/warped.tiff", os.O_RDONLY, 0644)
-	stuff, _ := ioutil.ReadAll(asdf)
-	w.Write(stuff)
+	png.Encode(w, warpedImg)
 }
 
 func render(radials []*archive2.Message31, product string, imageSize int, colorScheme string) *image.RGBA {
