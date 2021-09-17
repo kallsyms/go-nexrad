@@ -51,7 +51,7 @@ func main() {
 	a.Subscribe(window.OnWindowSize, onResize)
 	onResize("", nil)
 
-	var ar2 *archive2.Archive2 = archive2.NewArchive2("./KMPX20200906_053126_V06")
+	var ar2 *archive2.Archive2 = archive2.NewArchive2("/home/nickgregory/dev/weather_maps/l2rad/KOKX20210902_000428_V06")
 
 	// load the nexrad file
 	elevAngle := 0

@@ -6,219 +6,358 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"image/png"
 	"io/ioutil"
 	"math"
+	"net/http"
 	"os"
-	"runtime"
-	"strings"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/llgcode/draw2d"
+	"github.com/lukeroth/gdal"
+	"github.com/sirupsen/logrus"
 
 	"golang.org/x/image/colornames"
-	"golang.org/x/image/font"
-	"golang.org/x/image/math/fixed"
 
-	"github.com/cheggaaa/pb/v3"
 	"github.com/jddeal/go-nexrad/archive2"
 	"github.com/llgcode/draw2d/draw2dimg"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-	"golang.org/x/image/font/inconsolata"
+
+	"github.com/gorilla/mux"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
-
-var cmd = &cobra.Command{
-	Use:   "nexrad-render",
-	Short: "nexrad-render generates products from NEXRAD Level 2 (archive 2) data files.",
-	Run:   run,
-}
-
-var inputFile string
-var outputFile string
-var renderAll bool
-var colorScheme string
-var logLevel string
-var directory string
-var renderLabel bool
-var product string
-var imageSize int32
-var runners int
-var products []string
 
 var colorSchemes map[string]map[string]func(float32) color.Color
 
 func init() {
-	cmd.PersistentFlags().StringVarP(&inputFile, "file", "f", "", "archive 2 file to process")
-	cmd.PersistentFlags().StringVarP(&outputFile, "output", "o", "", "output radar image")
-	cmd.PersistentFlags().BoolVarP(&renderAll, "all", "a", false, "generate images for all elevations/products, treating output as a template receiving product name and elevation index")
-	cmd.PersistentFlags().StringVarP(&product, "product", "p", "ref", "product to produce. ex: ref, vel")
-	cmd.PersistentFlags().StringVarP(&colorScheme, "color-scheme", "c", "noaa", "color scheme to use. noaa, scope, pink")
-	cmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "warn", "log level, debug, info, warn, error")
-	cmd.PersistentFlags().Int32VarP(&imageSize, "size", "s", 1024, "size in pixel of the output image")
-	cmd.PersistentFlags().IntVarP(&runners, "threads", "t", runtime.NumCPU(), "threads")
-	cmd.PersistentFlags().StringVarP(&directory, "directory", "d", "", "directory of L2 files to process")
-	cmd.PersistentFlags().BoolVarP(&renderLabel, "label", "L", false, "label the image with station and date")
-
-	products = []string{"ref", "vel"}
-
 	colorSchemes = make(map[string]map[string]func(float32) color.Color)
-	colorSchemes["ref"] = map[string]func(float32) color.Color{
+	colorSchemes["REF"] = map[string]func(float32) color.Color{
 		"noaa":          dbzColorNOAA,
 		"radarscope":    dbzColorScope,
 		"scope-classic": dbzColorScopeClassic,
 		"pink":          dbzColor,
 		"clean-air":     dbzColorCleanAirMode,
 	}
-	colorSchemes["vel"] = map[string]func(float32) color.Color{
+	colorSchemes["VEL"] = map[string]func(float32) color.Color{
 		"noaa":       velColorRadarscope, // placeholder for default product value
 		"radarscope": velColorRadarscope,
 	}
 }
 
 func main() {
-	if err := cmd.Execute(); err != nil {
+	logrus.SetLevel(logrus.DebugLevel)
+
+	// https://l3-render-kmhncqyeya-uc.a.run.app/l3/OKX/N0Q/N0Q_20210905_0524/render
+	r := mux.NewRouter()
+	r.HandleFunc("/l2/{fn}/{elv}/{product}/render", renderHandler)
+	r.HandleFunc("/l2/{fn}.json", metaHandler)
+	r.HandleFunc("/l2/realtime/{site}/{volume}/{elv}/{product}/render", realtimeRenderHandler)
+	r.HandleFunc("/l2/realtime/{site}/{volume}.json", realtimeMetaHandler)
+
+	srv := &http.Server{
+		Addr: "0.0.0.0:8081",
+		// Good practice to set timeouts to avoid Slowloris attacks.
+		WriteTimeout: time.Second * 15,
+		ReadTimeout:  time.Second * 15,
+		IdleTimeout:  time.Second * 60,
+		Handler:      r, // Pass our instance of gorilla/mux in.
+	}
+
+	if err := srv.ListenAndServe(); err != nil {
 		fmt.Println(err)
-		os.Exit(1)
 	}
 }
 
-func run(cmd *cobra.Command, args []string) {
+func loadArchive2Realtime(site string, volume int) (*archive2.Archive2, error) {
+	sess, err := session.NewSession(&aws.Config{
+		Credentials: credentials.AnonymousCredentials,
+		Region:      aws.String("us-east-1"),
+	})
+	svc := s3.New(sess)
+	bucket := aws.String("unidata-nexrad-level2-chunks")
 
-	if _, ok := colorSchemes[product][colorScheme]; !ok {
-		logrus.Fatal(fmt.Sprintf("unsupported %s colorscheme %s", product, colorScheme))
-	}
-
-	lvl, err := logrus.ParseLevel(logLevel)
+	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{
+		Bucket: bucket,
+		Prefix: aws.String(fmt.Sprintf("%s/%d/", site, volume)),
+	})
 	if err != nil {
-		logrus.Fatal(err)
+		return nil, err
 	}
-	logrus.SetLevel(lvl)
 
-	if inputFile != "" {
-		out := "radar.png"
-		if outputFile != "" {
-			out = outputFile
-		}
-		if renderAll {
-			allInOne(inputFile, out)
-		} else {
-			single(inputFile, out, product)
-		}
-	} else if directory != "" {
-		out := "out"
-		if outputFile != "" {
-			out = outputFile
-		}
-		animate(directory, out, product)
-	}
-}
-
-func animate(dir, outdir, prod string) {
-	files, err := ioutil.ReadDir(dir)
+	headerFile, err := svc.GetObject(&s3.GetObjectInput{
+		Bucket: bucket,
+		Key:    resp.Contents[0].Key,
+	})
 	if err != nil {
-		logrus.Fatal(err)
+		return nil, err
 	}
 
-	// create the output dir
-	if _, err := os.Stat(outdir); os.IsNotExist(err) {
-		os.Mkdir(outdir, os.ModePerm)
+	ar2, err := archive2.NewArchive2(headerFile.Body)
+	headerFile.Body.Close()
+	if err != nil {
+		return nil, err
 	}
 
-	bar := pb.StartNew(len(files))
-
-	source := make(chan string, runners)
 	wg := sync.WaitGroup{}
-	wg.Add(runners)
-	for i := 0; i < runners; i++ {
-		go func(i int) {
-			for l2f := range source {
-				outf := fmt.Sprintf("%s/%s.png", outdir, l2f)
-				ar2, err := archive2.NewArchive2FromFile(dir + "/" + l2f)
-				if err != nil {
-					logrus.Fatal(err.Error())
-				}
-				elv := 1
-				if prod == "vel" {
-					elv = 2
-				}
-				render(outf, ar2.ElevationScans[elv], product, fmt.Sprintf("%s - %s", ar2.VolumeHeader.ICAO, ar2.VolumeHeader.Date()))
-				bar.Increment()
+	for _, chunkObjectInfo := range resp.Contents[1:] {
+		wg.Add(1)
+		go func(chunkObjectInfo *s3.Object) {
+			defer wg.Done()
+
+			chunk, err := svc.GetObject(&s3.GetObjectInput{
+				Bucket: bucket,
+				Key:    chunkObjectInfo.Key,
+			})
+			if err != nil {
+				return
 			}
-			wg.Done()
-		}(i)
-	}
 
-	for _, fn := range files {
-		if strings.HasSuffix(fn.Name(), ".ar2v") {
-			source <- fn.Name()
-		} else {
-			bar.Increment()
-		}
+			ar2.AddFromLDMRecord(chunk.Body)
+			chunk.Body.Close()
+		}(chunkObjectInfo)
 	}
-	close(source)
 	wg.Wait()
-	bar.Finish()
+
+	return ar2, nil
 }
 
-func single(in, out, product string) {
-	fmt.Printf("Generating %s from %s -> %s\n", product, in, out)
-
-	ar2, err := archive2.NewArchive2FromFile(in)
+func loadArchive2(fn string) (*archive2.Archive2, error) {
+	// fn is like KOKX20210902_000428_V06
+	site := fn[:4]
+	date, err := time.Parse("20060102_150405", fn[4:19])
 	if err != nil {
-		logrus.Fatal(err.Error())
+		return nil, err
 	}
 
-	elv := 1
-	if product == "vel" {
-		elv = 2 // uhhh, why did i do this again?
+	radResp, err := http.Get("https://noaa-nexrad-level2.s3.amazonaws.com/" + date.Format("2006/01/02/") + site + "/" + fn)
+	if err != nil {
+		return nil, err
 	}
 
-	render(out, ar2.ElevationScans[elv], product, fmt.Sprintf("%s - %s", ar2.VolumeHeader.ICAO, ar2.VolumeHeader.Date()))
+	defer radResp.Body.Close()
+
+	if radResp.StatusCode != 200 {
+		return nil, fmt.Errorf("Bad status code fetching file: %d", radResp.StatusCode)
+	}
+
+	return archive2.NewArchive2(radResp.Body)
 }
 
-func allInOne(in, outTemplate string) {
-	ar2, err := archive2.NewArchive2FromFile(in)
+func metaHandler(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	fn := vars["fn"]
+
+	ar2, err := loadArchive2(fn)
 	if err != nil {
-		logrus.Fatal(err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	wg := sync.WaitGroup{}
 	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
-
 	for elv, m31s := range ar2.ElevationScans {
 		headers[elv-1] = &m31s[0].Header
-		for _, product := range products {
-			wg.Add(1)
-			go func(ar2 *archive2.Archive2, product string, elv int) {
-				render(
-					fmt.Sprintf(outTemplate, product, elv),
-					ar2.ElevationScans[elv],
-					product,
-					fmt.Sprintf("%s - %s", ar2.VolumeHeader.ICAO, ar2.VolumeHeader.Date()),
-				)
-				wg.Done()
-			}(ar2, product, elv)
-		}
 	}
-
-	j, _ := json.MarshalIndent(headers, "", " ")
-	ioutil.WriteFile("headers.json", j, 0644)
-
-	wg.Wait()
+	j, _ := json.Marshal(headers)
+	w.Write(j)
 }
 
-func render(out string, radials []*archive2.Message31, product, label string) {
+func renderHandler(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	fn := vars["fn"]
+	elv, err := strconv.Atoi(vars["elv"])
+	if err != nil {
+		http.Error(w, "Invalid elv", http.StatusBadRequest)
+		return
+	}
+
+	product := vars["product"]
+
+	ar2, err := loadArchive2(fn)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	img := render(ar2.ElevationScans[elv], product, 1000, "noaa")
+	png.Encode(w, img)
+}
+
+func realtimeMetaHandler(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	site := vars["site"]
+	volume, err := strconv.Atoi(vars["volume"])
+	if err != nil {
+		http.Error(w, "Invalid volume number", http.StatusBadRequest)
+		return
+	}
+
+	ar2, err := loadArchive2Realtime(site, volume)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
+	for elv, m31s := range ar2.ElevationScans {
+		headers[elv-1] = &m31s[0].Header
+	}
+	j, _ := json.Marshal(headers)
+	w.Write(j)
+}
+
+func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	site := vars["site"]
+	volume, err := strconv.Atoi(vars["volume"])
+	if err != nil {
+		http.Error(w, "Invalid volume number", http.StatusBadRequest)
+		return
+	}
+
+	elv, err := strconv.Atoi(vars["elv"])
+	if err != nil {
+		http.Error(w, "Invalid elv", http.StatusBadRequest)
+		return
+	}
+
+	product := vars["product"]
+
+	ar2, err := loadArchive2Realtime(site, volume)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	imageSize := 1000
+
+	renderImg := render(ar2.ElevationScans[elv], product, imageSize, "noaa")
+	asdf, _ := os.OpenFile("/tmp/r.png", os.O_WRONLY|os.O_CREATE, 0644)
+	png.Encode(asdf, renderImg)
+	asdf.Close()
+
+	renderDSName := fmt.Sprintf(
+		"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte,PIXELOFFSET=0,LINEOFFSET=0,BANDOFFSET=0",
+		&renderImg.Pix[0],
+		renderImg.Rect.Dx(),
+		renderImg.Rect.Dy(),
+	)
+	fmt.Println(renderDSName)
+
+	//renderDS, err := gdal.Open(renderDSName, gdal.ReadOnly)
+	renderDS, err := gdal.Open("/tmp/r.png", gdal.ReadOnly)
+	if err != nil {
+		fmt.Printf("GDAL Open renderDS err: %v\n", err)
+		return
+	}
+
+	defer renderDS.Close()
+
+	// from pyart's projection: https://github.com/ARM-DOE/pyart/blob/master/pyart/io/output_to_geotiff.py#L119
+	renderDS.SetProjection(fmt.Sprintf(
+		`PROJCS[
+			"unnamed",
+			GEOGCS[
+				"WGS 84",
+				DATUM[
+					"unknown",
+					SPHEROID["WGS84",6378137,298.257223563]
+				],
+				PRIMEM["Greenwich",0],
+				UNIT["degree",0.0174532925199433]
+			],
+			PROJECTION["Azimuthal_Equidistant"],
+			PARAMETER["latitude_of_center",%f],
+			PARAMETER["longitude_of_center",%f],
+			PARAMETER["false_easting",0],
+			PARAMETER["false_northing",0],
+			UNIT["metre",1,AUTHORITY["EPSG","9001"]]
+		]`,
+		ar2.ElevationScans[elv][0].VolumeData.Lat,
+		ar2.ElevationScans[elv][0].VolumeData.Long,
+	))
+
+	distM := float64(460 * 1000) // what the min/max x/y bounds are, in meters
+	pixStepM := distM * 2.0 / float64(imageSize)
+	renderDS.SetGeoTransform([6]float64{-distM, -pixStepM, 0, distM, 0, pixStepM})
+
+	warpedImg := image.NewRGBA(image.Rect(0, 0, 6000, 2600))
+	// warpedDSName := fmt.Sprintf(
+	// 	"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte",
+	// 	&warpedImg.Pix[0],
+	// 	warpedImg.Rect.Dx(),
+	// 	warpedImg.Rect.Dy(),
+	// )
+
+	// warpedDS, err := gdal.Open(warpedDSName, gdal.Update)
+	// if err != nil {
+	// 	fmt.Printf("GDAL Open warpedDS err: %v\n", err)
+	// 	return
+	// }
+
+	// defer warpedDS.Close()
+
+	// spatialRef := gdal.CreateSpatialReference("")
+	// spatialRef.FromEPSG(3857)
+	// srString, _ := spatialRef.ToWKT()
+	// warpedDS.SetProjection(srString)
+
+	// warpedDS.SetGeoTransform([6]float64{
+	// 	-125,  // upper-left x coord
+	// 	(125.0-65.0)/float64(warpedImg.Rect.Dx()),  // x pixel res
+	// 	0, // row rotation
+	// 	50,  // upper-left y coord
+	// 	0, // col rotation
+	// 	(50.0-25.0)/float64(warpedImg.Rect.Dy()),  // y pixel res
+	// })
+
+	// warpedDS.SetGeoTransform([6]float64{
+	// 	-20026376.39,
+	// 	40000000/float64(warpedImg.Rect.Dx()),
+	// 	0,
+	// 	-20048966.10,
+	// 	0,
+	// 	40000000/float64(warpedImg.Rect.Dx()),
+	// })
+
+	// _, err = gdal.Warp("", &warpedDS, []gdal.Dataset{renderDS}, []string{
+	// 	"-srcalpha",
+	// 	"-dstalpha",
+	// })
+	_, err = gdal.Warp("/tmp/warped.tiff", nil, []gdal.Dataset{renderDS}, []string{
+		"-srcalpha",
+		"-t_srs", "EPSG:3857",
+		"-te", "-20026376.39", "-20048966.10", "20026376.39", "20048966.10",
+		//"-te", "-125", "25", "-65", "50",
+		"-ts", strconv.Itoa(warpedImg.Rect.Dx()), strconv.Itoa(warpedImg.Rect.Dy()),
+		"-dstalpha",
+	})
+	if err != nil {
+		fmt.Printf("Warp err: %v\n", err)
+		return
+	}
+
+	asdf, _ = os.OpenFile("/tmp/warped.tiff", os.O_RDONLY, 0644)
+	stuff, _ := ioutil.ReadAll(asdf)
+	w.Write(stuff)
+}
+
+func render(radials []*archive2.Message31, product string, imageSize int, colorScheme string) *image.RGBA {
 	width := float64(imageSize)
 	height := float64(imageSize)
 
-	canvas := image.NewRGBA(image.Rect(0, 0, int(width), int(height)))
-	draw.Draw(canvas, canvas.Bounds(), image.Black, image.ZP, draw.Src)
+	canvas := image.NewRGBA(image.Rect(0, 0, imageSize, imageSize))
+	draw.Draw(canvas, canvas.Bounds(), image.Transparent, image.ZP, draw.Src)
 
 	gc := draw2dimg.NewGraphicContext(canvas)
 
 	xc := width / 2
 	yc := height / 2
-	pxPerKm := width / 2 / 460
+	pxPerKm := width / 2 / 460 // NEXRAD goes to 460km
 	firstGatePx := float64(radials[0].REFData.DataMomentRange) / 1000 * pxPerKm
 	gateIntervalKm := float64(radials[0].REFData.DataMomentRangeSampleInterval) / 1000
 	gateWidthPx := gateIntervalKm * pxPerKm
@@ -245,9 +384,9 @@ func render(out string, radials []*archive2.Message31, product, label string) {
 
 		var gates []float32
 		switch product {
-		case "ref":
+		case "REF":
 			gates = radial.REFData.ScaledData()
-		case "vel":
+		case "VEL":
 			gates = radial.VELData.ScaledData()
 
 		}
@@ -276,24 +415,7 @@ func render(out string, radials []*archive2.Message31, product, label string) {
 		}
 	}
 
-	if renderLabel {
-		addLabel(canvas, int(width-295.0), int(height-10.0), label)
-	}
-
-	// Save to file
-	draw2dimg.SaveToPngFile(out, canvas)
-}
-
-func addLabel(img *image.RGBA, x, y int, label string) {
-	point := fixed.Point26_6{fixed.Int26_6(x * 64), fixed.Int26_6(y * 64)}
-
-	d := &font.Drawer{
-		Dst:  img,
-		Src:  image.NewUniform(colornames.Gray),
-		Face: inconsolata.Bold8x16,
-		Dot:  point,
-	}
-	d.DrawString(label)
+	return canvas
 }
 
 func dbzColor(dbz float32) color.Color {
@@ -494,7 +616,6 @@ func velColorRadarscope(vel float32) color.Color {
 	// }
 
 	i := scaleInt(int32(vel), 140, -140, int32(len(colors))-1, 0)
-	// logrus.Debugf("converted %4f to %2d", vel, i)
 	return colors[i]
 }
 

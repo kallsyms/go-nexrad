@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -69,7 +67,7 @@ type Message31 struct {
 }
 
 // NewMessage31 from the provided io.Reader
-func NewMessage31(r io.Reader, build float32) *Message31 {
+func NewMessage31(r io.Reader, build float32) (*Message31, error) {
 	header := Message31Header{}
 	binary.Read(r, binary.BigEndian, &header)
 
@@ -81,10 +79,9 @@ func NewMessage31(r io.Reader, build float32) *Message31 {
 	}
 
 	for i := uint16(0); i < header.DataBlockCount; i++ {
-
 		d := DataBlock{}
 		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
-			logrus.Panic(err.Error())
+			return nil, err
 		}
 
 		blockName := string(d.DataName[:])
@@ -126,11 +123,10 @@ func NewMessage31(r io.Reader, build float32) *Message31 {
 				m31.CFPData = moment
 			}
 		default:
-			logrus.Error(header)
-			logrus.Panicf("Data Block - unknown type '%s'", blockName)
+			return nil, fmt.Errorf("Data Block - unknown type '%s'", blockName)
 		}
 	}
-	return &m31
+	return &m31, nil
 }
 
 // AzimuthResolutionSpacing returns the spacing in degrees
