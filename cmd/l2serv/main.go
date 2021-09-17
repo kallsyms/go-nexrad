@@ -50,7 +50,7 @@ func init() {
 func main() {
 	logrus.SetLevel(logrus.DebugLevel)
 
-	// https://l3-render-kmhncqyeya-uc.a.run.app/l3/OKX/N0Q/N0Q_20210905_0524/render
+	// l3 format is l3/{site}/{product}/{filename}/render
 	r := mux.NewRouter()
 	r.HandleFunc("/l2/{fn}/{elv}/{product}/render", renderHandler)
 	r.HandleFunc("/l2/{fn}.json", metaHandler)
@@ -146,6 +146,15 @@ func loadArchive2(fn string) (*archive2.Archive2, error) {
 	return archive2.NewArchive2(radResp.Body)
 }
 
+func writeMeta(w http.ResponseWriter, ar2 *archive2.Archive2) {
+	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
+	for elv, m31s := range ar2.ElevationScans {
+		headers[elv-1] = &m31s[0].Header
+	}
+	j, _ := json.Marshal(headers)
+	w.Write(j)
+}
+
 func metaHandler(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	fn := vars["fn"]
@@ -156,12 +165,25 @@ func metaHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
-	for elv, m31s := range ar2.ElevationScans {
-		headers[elv-1] = &m31s[0].Header
+	writeMeta(w, ar2)
+}
+
+func realtimeMetaHandler(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	site := vars["site"]
+	volume, err := strconv.Atoi(vars["volume"])
+	if err != nil {
+		http.Error(w, "Invalid volume number", http.StatusBadRequest)
+		return
 	}
-	j, _ := json.Marshal(headers)
-	w.Write(j)
+
+	ar2, err := loadArchive2Realtime(site, volume)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeMeta(w, ar2)
 }
 
 func renderHandler(w http.ResponseWriter, req *http.Request) {
@@ -181,31 +203,9 @@ func renderHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	img := render(ar2.ElevationScans[elv], product, 1000, "noaa")
-	png.Encode(w, img)
-}
-
-func realtimeMetaHandler(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
-	site := vars["site"]
-	volume, err := strconv.Atoi(vars["volume"])
-	if err != nil {
-		http.Error(w, "Invalid volume number", http.StatusBadRequest)
-		return
-	}
-
-	ar2, err := loadArchive2Realtime(site, volume)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
-	for elv, m31s := range ar2.ElevationScans {
-		headers[elv-1] = &m31s[0].Header
-	}
-	j, _ := json.Marshal(headers)
-	w.Write(j)
+	warpedDS := renderAndReproject(ar2.ElevationScans[elv], product, 6000, 2600)
+	png.Encode(w, warpedDS.Image)
+	warpedDS.DS.Close()
 }
 
 func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
@@ -231,32 +231,72 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	imageSize := 1000
+	warpedDS := renderAndReproject(ar2.ElevationScans[elv], product, 6000, 2600)
+	png.Encode(w, warpedDS.Image)
+	warpedDS.DS.Close()
+}
 
-	renderImg := render(ar2.ElevationScans[elv], product, imageSize, "noaa")
-	// asdf, _ := os.OpenFile("/tmp/r.png", os.O_WRONLY|os.O_CREATE, 0644)
-	// png.Encode(asdf, renderImg)
-	// asdf.Close()
+func renderAndReproject(radials []*archive2.Message31, product string, width, height int) imageDS {
+	intermediateSize := 1000 // width and height of initial rendered image before projection
+	renderDS := getRenderDS(radials, product, intermediateSize, "noaa")
+	defer renderDS.DS.Close()
 
-	renderDSName := fmt.Sprintf(
-		// PIXELOFFSET=4 since we have 4 bytes between the start of any given pixel (R,G,B,A)
-		// BANDOFFSET=1 means the value for a band is 1 byte after the prev band
-		"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte,PIXELOFFSET=4,BANDOFFSET=1",
-		&renderImg.Pix[0],
-		renderImg.Rect.Dx(),
-		renderImg.Rect.Dy(),
-	)
+	warpedImg := image.NewRGBA(image.Rect(0, 0, width, height))
+	warpedDS := makeImageDS(warpedImg)
 
-	renderDS, err := gdal.Open(renderDSName, gdal.ReadOnly)
-	if err != nil {
-		fmt.Printf("GDAL Open renderDS err: %v\n", err)
-		return
-	}
+	spatialRef := gdal.CreateSpatialReference("")
+	spatialRef.FromEPSG(3857)
+	srString, _ := spatialRef.ToWKT()
+	warpedDS.DS.SetProjection(srString)
 
-	defer renderDS.Close()
+	// warpedDS.SetGeoTransform([6]float64{
+	// 	-125,  // upper-left x coord
+	// 	(125.0-65.0)/float64(warpedImg.Rect.Dx()),  // x pixel res
+	// 	0, // row rotation
+	// 	50,  // upper-left y coord
+	// 	0, // col rotation
+	// 	(50.0-25.0)/float64(warpedImg.Rect.Dy()),  // y pixel res
+	// })
+
+	// gdaltransform -s_srs epsg:4326 -t_srs epsg:3857
+	// -125 50
+	// -13914936.3491592 6446275.84101716 0
+	upperLeftX := -13914936.3491592
+	upperLeftY := 6446275.84101716
+	// -65 25
+	// -7235766.90156278 2875744.62435224 0
+	lowerRightX := -7235766.90156278
+	lowerRightY := 2875744.62435224
+	warpedDS.DS.SetGeoTransform([6]float64{
+		upperLeftX,
+		(lowerRightX - upperLeftX) / float64(warpedDS.Image.Rect.Dx()),
+		0,
+		upperLeftY,
+		0,
+		(lowerRightY - upperLeftY) / float64(warpedDS.Image.Rect.Dy()),
+	})
+
+	gdal.Warp("", &warpedDS.DS, []gdal.Dataset{renderDS.DS}, []string{
+		"-srcalpha",
+		"-dstalpha",
+	})
+
+	return warpedDS
+}
+
+// little helper to keep both a GDAL dataset and the DS's backing Image together
+// both for convenience but also to make sure the DS's backing memory doesn't get GCd
+type imageDS struct {
+	DS    gdal.Dataset
+	Image *image.RGBA
+}
+
+func getRenderDS(radials []*archive2.Message31, product string, imageSize int, colorScheme string) imageDS {
+	renderImg := render(radials, product, imageSize, "noaa")
+	renderDS := makeImageDS(renderImg)
 
 	// from pyart's projection: https://github.com/ARM-DOE/pyart/blob/master/pyart/io/output_to_geotiff.py#L119
-	renderDS.SetProjection(fmt.Sprintf(
+	renderDS.DS.SetProjection(fmt.Sprintf(
 		`PROJCS[
 			"unnamed",
 			GEOGCS[
@@ -275,18 +315,21 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 			PARAMETER["false_northing",0],
 			UNIT["metre",1,AUTHORITY["EPSG","9001"]]
 		]`,
-		ar2.ElevationScans[elv][0].VolumeData.Lat,
-		ar2.ElevationScans[elv][0].VolumeData.Long,
+		radials[0].VolumeData.Lat,
+		radials[0].VolumeData.Long,
 	))
 
 	distM := float64(460 * 1000) // what the min/max x/y bounds are, in meters
-	pixStepM := distM * 2.0 / float64(imageSize)
-	renderDS.SetGeoTransform([6]float64{-distM, -pixStepM, 0, distM, 0, pixStepM})
+	pixStepM := distM * 2.0 / float64(renderImg.Rect.Dx())
+	renderDS.DS.SetGeoTransform([6]float64{-distM, pixStepM, 0, distM, 0, -pixStepM})
 
 	// sanity check renderDS was loaded properly
 	// gdal.Translate("/tmp/o.png", renderDS, []string{})
 
-	warpedImg := image.NewRGBA(image.Rect(0, 0, 6000, 2600))
+	return renderDS
+}
+
+func makeImageDS(warpedImg *image.RGBA) imageDS {
 	warpedDSName := fmt.Sprintf(
 		"MEM:::DATAPOINTER=%p,PIXELS=%d,LINES=%d,BANDS=4,DATATYPE=Byte,PIXELOFFSET=4,BANDOFFSET=1",
 		&warpedImg.Pix[0],
@@ -294,47 +337,12 @@ func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
 		warpedImg.Rect.Dy(),
 	)
 
-	warpedDS, err := gdal.Open(warpedDSName, gdal.Update)
-	if err != nil {
-		fmt.Printf("GDAL Open warpedDS err: %v\n", err)
-		return
+	warpedDS, _ := gdal.Open(warpedDSName, gdal.Update)
+
+	return imageDS{
+		warpedDS,
+		warpedImg,
 	}
-
-	defer warpedDS.Close()
-
-	spatialRef := gdal.CreateSpatialReference("")
-	spatialRef.FromEPSG(3857)
-	srString, _ := spatialRef.ToWKT()
-	warpedDS.SetProjection(srString)
-
-	// warpedDS.SetGeoTransform([6]float64{
-	// 	-125,  // upper-left x coord
-	// 	(125.0-65.0)/float64(warpedImg.Rect.Dx()),  // x pixel res
-	// 	0, // row rotation
-	// 	50,  // upper-left y coord
-	// 	0, // col rotation
-	// 	(50.0-25.0)/float64(warpedImg.Rect.Dy()),  // y pixel res
-	// })
-
-	warpedDS.SetGeoTransform([6]float64{
-		-20026376.39,
-		40000000 / float64(warpedImg.Rect.Dx()),
-		0,
-		-20048966.10,
-		0,
-		40000000 / float64(warpedImg.Rect.Dy()),
-	})
-
-	_, err = gdal.Warp("", &warpedDS, []gdal.Dataset{renderDS}, []string{
-		"-srcalpha",
-		"-dstalpha",
-	})
-	if err != nil {
-		fmt.Printf("Warp err: %v\n", err)
-		return
-	}
-
-	png.Encode(w, warpedImg)
 }
 
 func render(radials []*archive2.Message31, product string, imageSize int, colorScheme string) *image.RGBA {
