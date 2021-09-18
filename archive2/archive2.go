@@ -1,13 +1,13 @@
 package archive2
 
 import (
-	"compress/bzip2"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 
+	"github.com/dsnet/compress/bzip2"
 	"github.com/fatih/color"
 	"github.com/sirupsen/logrus"
 )
@@ -40,11 +40,7 @@ func (ar2 *Archive2) AddFromLDMRecord(reader io.Reader) (int32, error) {
 
 	logrus.Debugf("LDM Compressed Record (%s bytes)", color.CyanString("%d", ldm.Size))
 
-	bzipReader := bzip2.NewReader(io.LimitReader(reader, int64(ldm.Size)))
-
-	// this uses the alternative bzip2 implementation from github.com/dsnet/compress/bzip2 but the improvement
-	// didn't seem substantial enough to add the dependency (~2.2s down to ~2.0s)
-	// bzipReader, _ := bzip2.NewReader(bytes.NewReader(compressedRecord), nil)
+	bzipReader, _ := bzip2.NewReader(io.LimitReader(reader, int64(ldm.Size)), nil)
 
 	// read until no more messages are available
 	messageCounts := map[uint8]int{

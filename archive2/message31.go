@@ -99,7 +99,7 @@ func NewMessage31(r io.Reader, build float32) (*Message31, error) {
 			// the data moment length is determined with (num gates * word size) / 8.
 			dataMomentSize := m.NumberDataMomentGates * uint16(m.DataWordSize) / 8
 			data := make([]uint8, dataMomentSize)
-			binary.Read(r, binary.BigEndian, &data)
+			io.ReadFull(r, data)
 
 			moment := DataMoment{
 				GenericDataMoment: m,
