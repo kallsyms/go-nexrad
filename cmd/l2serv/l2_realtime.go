@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"image/png"
 	"net/http"
@@ -33,6 +34,10 @@ func loadArchive2Realtime(site string, volume int) (*archive2.Archive2, error) {
 		return nil, err
 	}
 
+	if len(resp.Contents) == 0 {
+		return nil, errors.New("No such volume number")
+	}
+
 	headerFile, err := svc.GetObject(&s3.GetObjectInput{
 		Bucket: bucket,
 		Key:    resp.Contents[0].Key,
@@ -47,6 +52,7 @@ func loadArchive2Realtime(site string, volume int) (*archive2.Archive2, error) {
 		return nil, err
 	}
 
+	mtx := sync.Mutex{}
 	wg := sync.WaitGroup{}
 	for _, chunkObjectInfo := range resp.Contents[1:] {
 		wg.Add(1)
@@ -61,8 +67,14 @@ func loadArchive2Realtime(site string, volume int) (*archive2.Archive2, error) {
 				return
 			}
 
-			ar2.AddFromLDMRecord(chunk.Body)
+			record, err := ar2.LoadLDMRecord(chunk.Body)
 			chunk.Body.Close()
+			if err != nil {
+				return
+			}
+			mtx.Lock()
+			ar2.AddFromLDMRecord(record)
+			mtx.Unlock()
 		}(chunkObjectInfo)
 	}
 	wg.Wait()

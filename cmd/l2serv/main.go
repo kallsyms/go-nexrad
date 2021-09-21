@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"image/png"
 	"net/http"
-	"os"
 	"path/filepath"
-	"runtime/pprof"
 	"strconv"
 	"time"
 
@@ -15,9 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/sirupsen/logrus"
-
 	"github.com/jddeal/go-nexrad/archive2"
+	"github.com/sirupsen/logrus"
 
 	"github.com/gorilla/mux"
 )
@@ -31,7 +28,7 @@ func main() {
 	r.HandleFunc("/l2/{site}/{fn}", metaHandler)
 	r.HandleFunc("/l2/{site}/{fn}/{elv}/{product}/render", renderHandler)
 
-	r.HandleFunc("/l2-realtime/{site}/{volume}.json", realtimeMetaHandler)
+	r.HandleFunc("/l2-realtime/{site}/{volume}", realtimeMetaHandler)
 	r.HandleFunc("/l2-realtime/{site}/{volume}/{elv}/{product}/render", realtimeRenderHandler)
 
 	srv := &http.Server{
@@ -126,33 +123,6 @@ func listFilesHandler(w http.ResponseWriter, req *http.Request) {
 	w.Write(j)
 }
 
-func loadArchive2(fn string) (*archive2.Archive2, error) {
-	// fn is like KOKX20210902_000428_V06
-	site := fn[:4]
-	date, err := time.Parse("20060102_150405", fn[4:19])
-	if err != nil {
-		return nil, err
-	}
-
-	radResp, err := http.Get("https://noaa-nexrad-level2.s3.amazonaws.com/" + date.Format("2006/01/02/") + site + "/" + fn)
-	if err != nil {
-		return nil, err
-	}
-
-	defer radResp.Body.Close()
-
-	if radResp.StatusCode != 200 {
-		return nil, fmt.Errorf("Bad status code fetching file: %d", radResp.StatusCode)
-	}
-
-	f, _ := os.Create("/tmp/pprof")
-	pprof.StartCPUProfile(f)
-	ar2, err := archive2.NewArchive2(radResp.Body)
-	pprof.StopCPUProfile()
-	f.Close()
-	return ar2, err
-}
-
 func writeMeta(w http.ResponseWriter, ar2 *archive2.Archive2) {
 	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
 	for elv, m31s := range ar2.ElevationScans {
@@ -166,13 +136,14 @@ func metaHandler(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	fn := vars["fn"]
 
-	ar2, err := loadArchive2(fn)
+	meta, _, err := ChunkCache.GetMeta(fn)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	writeMeta(w, ar2)
+	j, _ := json.Marshal(meta)
+	w.Write(j)
 }
 
 func renderHandler(w http.ResponseWriter, req *http.Request) {
@@ -186,7 +157,11 @@ func renderHandler(w http.ResponseWriter, req *http.Request) {
 
 	product := vars["product"]
 
-	ar2, err := loadArchive2(fn)
+	// f, _ := os.Create("/tmp/pprof")
+	// runtime.SetCPUProfileRate(1000)
+	// pprof.StartCPUProfile(f)
+
+	ar2, err := ChunkCache.GetFileWithElevation(fn, elv)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -195,4 +170,7 @@ func renderHandler(w http.ResponseWriter, req *http.Request) {
 	warpedDS := renderAndReproject(ar2.ElevationScans[elv], product, 6000, 2600)
 	png.Encode(w, warpedDS.Image)
 	warpedDS.DS.Close()
+
+	// pprof.StopCPUProfile()
+	// f.Close()
 }

@@ -12,10 +12,23 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// LoadedLDMRecord holds both the LDM record information itself, as well as the various
+// messages that were in the record
+type LoadedLDMRecord struct {
+	LDMRecord
+	M2   *Message2
+	M31s []*Message31
+}
+
 // Archive2 wrapper for processed archive 2 data files.
 type Archive2 struct {
 	VolumeHeader VolumeHeaderRecord
 
+	LDMOffsets []int
+	LDMRecords []*LoadedLDMRecord
+
+	// Mutex so ElevationScans can be concurrently updated, e.g. in the case of loading
+	// chunks in parallel
 	mtx            sync.Mutex
 	ElevationScans map[int][]*Message31
 
@@ -24,13 +37,13 @@ type Archive2 struct {
 	metadataStatusMessage *Message2
 }
 
-func (ar2 *Archive2) AddFromLDMRecord(reader io.Reader) (int32, error) {
+func (ar2 *Archive2) LoadLDMRecord(reader io.Reader) (*LoadedLDMRecord, error) {
 	ldm := LDMRecord{}
 
 	// read in size of LDM record
 	err := binary.Read(reader, binary.BigEndian, &ldm.Size)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	// the size can be negative, but you just interpret it as positive (RDA/RPG 7.3.4)
@@ -42,12 +55,12 @@ func (ar2 *Archive2) AddFromLDMRecord(reader io.Reader) (int32, error) {
 
 	bzipReader, _ := bzip2.NewReader(io.LimitReader(reader, int64(ldm.Size)), nil)
 
-	// read until no more messages are available
-	messageCounts := map[uint8]int{
-		2:  0,
-		31: 0,
+	totalMessages := 0
+	loadedRecord := &LoadedLDMRecord{
+		LDMRecord: ldm,
 	}
 
+	// read until no more messages are available
 	for true {
 		// eat 12 bytes due to legacy compliance of CTM Header, these are all set to nil
 		io.ReadFull(bzipReader, make([]byte, 12))
@@ -56,37 +69,33 @@ func (ar2 *Archive2) AddFromLDMRecord(reader io.Reader) (int32, error) {
 		header := MessageHeader{}
 		if err := binary.Read(bzipReader, binary.BigEndian, &header); err != nil {
 			if err != io.EOF {
-				return ldm.Size, err
+				return loadedRecord, err
 			}
 			break
 		}
 
+		totalMessages += 1
 		logrus.Tracef("  Message Type %d (segments: %d size: %d)", header.MessageType, header.NumMessageSegments, header.MessageSize)
 
 		// anything not called out in the switch falls into the default (and is skipped)
 		switch header.MessageType {
 		case 2:
 			// we'll keep the first one - it should be the metadata record's
-			m2 := Message2{}
-			binary.Read(bzipReader, binary.BigEndian, &m2)
+			loadedRecord.M2 = &Message2{}
+			binary.Read(bzipReader, binary.BigEndian, loadedRecord.M2)
 
-			if m2.GetBuildNumber() < 18 {
-				return ldm.Size, fmt.Errorf("This file is build %.2f. Only build 19.00 is well supported. Try a more recent file.", m2.GetBuildNumber())
+			if loadedRecord.M2.GetBuildNumber() < 18 {
+				return loadedRecord, fmt.Errorf("This file is build %.2f. Only build 19.00 is well supported. Try a more recent file.", loadedRecord.M2.GetBuildNumber())
 			}
 
 			// skip the rest
 			io.ReadFull(bzipReader, make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16-68))
 
-			// keep a reference around
-			if ar2.metadataStatusMessage == nil {
-				ar2.metadataStatusMessage = &m2
-			}
-
 		case 31:
 			m31, err := NewMessage31(bzipReader, ar2.metadataStatusMessage.GetBuildNumber())
 
 			if err != nil {
-				return ldm.Size, err
+				return loadedRecord, err
 			}
 
 			// instead of having every message dump data out, we'll just look at the 0-1 degree data
@@ -94,33 +103,33 @@ func (ar2 *Archive2) AddFromLDMRecord(reader io.Reader) (int32, error) {
 				logrus.Trace(m31)
 			}
 
-			ar2.mtx.Lock()
-			ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
-			ar2.mtx.Unlock()
+			loadedRecord.M31s = append(loadedRecord.M31s, m31)
 
 		default:
 			// not handled, skip the rest - which we know is DEFAULT - CTM - header
 			io.ReadFull(bzipReader, make([]byte, DefaultMetadataRecordLength-LegacyCTMHeaderLength-16))
 		}
-
-		if _, ok := messageCounts[header.MessageType]; ok {
-			messageCounts[header.MessageType]++
-		} else {
-			messageCounts[header.MessageType] = 1
-		}
 	}
 
-	// helpful for debugging
-	totalMessages := 0
-	for _, count := range messageCounts {
-		totalMessages += count
-	}
 	logrus.Debugf("  found %s messages in this record", color.CyanString("%d", totalMessages))
-	for msgType, count := range messageCounts {
-		logrus.Debugf("    type %02d had %d messages", msgType, count)
+	if loadedRecord.M2 != nil {
+		logrus.Debugf("    m2 found in record")
+	}
+	if len(loadedRecord.M31s) > 0 {
+		logrus.Debugf("    %s m31s found in record", color.CyanString("%d", len(loadedRecord.M31s)))
 	}
 
-	return ldm.Size, nil
+	return loadedRecord, nil
+}
+
+func (ar2 *Archive2) AddFromLDMRecord(loadedRecord *LoadedLDMRecord) {
+	if loadedRecord.M2 != nil && ar2.metadataStatusMessage == nil {
+		// keep a reference around
+		ar2.metadataStatusMessage = loadedRecord.M2
+	}
+	for _, m31 := range loadedRecord.M31s {
+		ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
+	}
 }
 
 // NewArchive2 returns a new Archive2 from the provided reader
@@ -140,17 +149,20 @@ func NewArchive2(reader io.Reader) (*Archive2, error) {
 	binary.Read(reader, binary.BigEndian, &ar2.VolumeHeader)
 	logrus.Info(ar2.VolumeHeader.Filename())
 
+	offset := 24
+
 	// read until no more LDM records are available
-	LDMCount := 0
 	for true {
-		_, err := ar2.AddFromLDMRecord(reader)
+		loadedRecord, err := ar2.LoadLDMRecord(reader)
 		if err == io.EOF {
 			break
 		} else if err != nil {
 			return nil, err
 		}
-
-		LDMCount++
+		ar2.LDMOffsets = append(ar2.LDMOffsets, offset)
+		offset += int(loadedRecord.LDMRecord.Size) + 4
+		ar2.LDMRecords = append(ar2.LDMRecords, loadedRecord)
+		ar2.AddFromLDMRecord(loadedRecord)
 	}
 
 	return &ar2, nil
