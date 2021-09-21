@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"image/png"
+	"io/ioutil"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -167,9 +167,10 @@ func renderHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	warpedDS := renderAndReproject(ar2.ElevationScans[elv], product, 6000, 2600)
-	png.Encode(w, warpedDS.Image)
-	warpedDS.DS.Close()
+	pngFile := renderAndReproject(ar2.ElevationScans[elv], product, 6000, 2600)
+	png, _ := ioutil.ReadAll(pngFile)
+	pngFile.Close()
+	w.Write(png)
 
 	// pprof.StopCPUProfile()
 	// f.Close()

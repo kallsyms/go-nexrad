@@ -5,7 +5,9 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"io"
 	"math"
+	"os"
 
 	"github.com/llgcode/draw2d"
 	"github.com/lukeroth/gdal"
@@ -33,13 +35,14 @@ func init() {
 	}
 }
 
-func renderAndReproject(radials []*archive2.Message31, product string, width, height int) imageDS {
+func renderAndReproject(radials []*archive2.Message31, product string, width, height int) io.ReadCloser {
 	intermediateSize := 1000 // width and height of initial rendered image before projection
 	renderDS := getRenderDS(radials, product, intermediateSize, "noaa")
 	defer renderDS.DS.Close()
 
 	warpedImg := image.NewRGBA(image.Rect(0, 0, width, height))
 	warpedDS := makeImageDS(warpedImg)
+	defer warpedDS.DS.Close()
 
 	spatialRef := gdal.CreateSpatialReference("")
 	spatialRef.FromEPSG(3857)
@@ -78,7 +81,10 @@ func renderAndReproject(radials []*archive2.Message31, product string, width, he
 		"-dstalpha",
 	})
 
-	return warpedDS
+	png, _ := os.CreateTemp("", "*.png")
+	gdal.Translate(png.Name(), warpedDS.DS, []string{})
+
+	return png
 }
 
 // little helper to keep both a GDAL dataset and the DS's backing Image together
