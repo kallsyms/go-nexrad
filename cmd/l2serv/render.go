@@ -40,6 +40,8 @@ func renderAndReproject(radials []*archive2.Message31, product string, width, he
 	renderDS := getRenderDS(radials, product, intermediateSize, "noaa")
 	defer renderDS.DS.Close()
 
+	// TODO: we don't need warpedImg anymore since we use GDAL translate to convert to PNG
+	// is there some other format/backend that would be faster for GDAL just to hold between warp and translate?
 	warpedImg := image.NewRGBA(image.Rect(0, 0, width, height))
 	warpedDS := makeImageDS(warpedImg)
 	defer warpedDS.DS.Close()
@@ -81,6 +83,7 @@ func renderAndReproject(radials []*archive2.Message31, product string, width, he
 		"-dstalpha",
 	})
 
+	// Use gdal.Translate instead of go's png.Encode. Seems to be ~1.6x faster (600ms instead of 1000ms)
 	png, _ := os.CreateTemp("", "*.png")
 	gdal.Translate(png.Name(), warpedDS.DS, []string{})
 

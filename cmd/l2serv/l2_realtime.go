@@ -8,9 +8,8 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/gin-gonic/gin"
 	"github.com/jddeal/go-nexrad/archive2"
-
-	"github.com/gorilla/mux"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -82,49 +81,53 @@ func loadArchive2Realtime(site string, volume int) (*archive2.Archive2, error) {
 	return ar2, nil
 }
 
-func realtimeMetaHandler(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
-	site := vars["site"]
-	volume, err := strconv.Atoi(vars["volume"])
+func realtimeMetaHandler(c *gin.Context) {
+	site := c.Param("site")
+	volume, err := strconv.Atoi(c.Param("volume"))
 	if err != nil {
-		http.Error(w, "Invalid volume number", http.StatusBadRequest)
+		c.AbortWithError(http.StatusBadRequest, errors.New("Invalid elv"))
 		return
 	}
 
 	ar2, err := loadArchive2Realtime(site, volume)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
 
-	writeMeta(w, ar2)
+	headers := make([]*archive2.Message31Header, len(ar2.ElevationScans))
+	for elv, m31s := range ar2.ElevationScans {
+		headers[elv-1] = &m31s[0].Header
+	}
+
+	c.JSON(200, headers)
 }
 
-func realtimeRenderHandler(w http.ResponseWriter, req *http.Request) {
-	vars := mux.Vars(req)
-	site := vars["site"]
-	volume, err := strconv.Atoi(vars["volume"])
+func realtimeRenderHandler(c *gin.Context) {
+	site := c.Param("site")
+	volume, err := strconv.Atoi(c.Param("volume"))
 	if err != nil {
-		http.Error(w, "Invalid volume number", http.StatusBadRequest)
+		c.AbortWithError(http.StatusBadRequest, err)
 		return
 	}
 
-	elv, err := strconv.Atoi(vars["elv"])
+	elv, err := strconv.Atoi(c.Param("elv"))
 	if err != nil {
-		http.Error(w, "Invalid elv", http.StatusBadRequest)
+		c.AbortWithError(http.StatusBadRequest, err)
 		return
 	}
 
-	product := vars["product"]
+	product := c.Param("product")
 
 	ar2, err := loadArchive2Realtime(site, volume)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		c.AbortWithError(http.StatusInternalServerError, err)
 		return
 	}
 
 	pngFile := renderAndReproject(ar2.ElevationScans[elv], product, 6000, 2600)
 	png, _ := ioutil.ReadAll(pngFile)
 	pngFile.Close()
-	w.Write(png)
+
+	c.Data(http.StatusOK, "image/png", png)
 }
