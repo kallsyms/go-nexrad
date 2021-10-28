@@ -18,7 +18,7 @@ import (
 	"github.com/g3n/engine/renderer"
 	"github.com/g3n/engine/util/helper"
 	"github.com/g3n/engine/window"
-	"github.com/jddeal/go-nexrad/archive2"
+	"github.com/kallsyms/go-nexrad/archive2"
 )
 
 func main() {

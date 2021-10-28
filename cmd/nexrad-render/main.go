@@ -20,7 +20,7 @@ import (
 	"golang.org/x/image/math/fixed"
 
 	"github.com/cheggaaa/pb/v3"
-	"github.com/jddeal/go-nexrad/archive2"
+	"github.com/kallsyms/go-nexrad/archive2"
 	"github.com/llgcode/draw2d/draw2dimg"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"

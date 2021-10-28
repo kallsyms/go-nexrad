@@ -4,8 +4,8 @@ import (
 	"os"
 
 	"github.com/fatih/color"
-	"github.com/jddeal/go-nexrad/archive2"
 	"github.com/jessevdk/go-flags"
+	"github.com/kallsyms/go-nexrad/archive2"
 	"github.com/sirupsen/logrus"
 )
 
