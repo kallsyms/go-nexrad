@@ -3,7 +3,7 @@ package main
 import (
 	"image/color"
 
-	"github.com/bwiggs/go-nexrad/archive2"
+	"github.com/kallsyms/go-nexrad/archive2"
 	"golang.org/x/image/colornames"
 )
 

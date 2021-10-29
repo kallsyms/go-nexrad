@@ -1,13 +1,26 @@
 package archive2
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
+	"sync"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/dsnet/compress/bzip2"
 	"github.com/sirupsen/logrus"
 )
+
+// LoadedLDMRecord holds both the LDM record information itself, as well as the various
+// messages that were in the record
+type LoadedLDMRecord struct {
+	LDMRecord
+	M2   *Message2
+	M3   *Message3
+	M31s []*Message31
+}
 
 // Archive2 wrapper for processed archive 2 data files.
 type Archive2 struct {
@@ -16,10 +29,115 @@ type Archive2 struct {
 	VolumeHeader     VolumeHeaderRecord
 	RadarStatus      *Message2
 	RadarPerformance *Message3
+
+	LDMOffsets []int
+	LDMRecords []*LoadedLDMRecord
+
+	// Mutex so ElevationScans can be concurrently updated, e.g. in the case of loading
+	// chunks in parallel
+	mtx sync.Mutex
 }
 
-// Extract data from a given archive 2 data file.
-func Extract(f io.ReadSeeker) *Archive2 {
+func (ar2 *Archive2) LoadLDMRecord(reader io.Reader) (*LoadedLDMRecord, error) {
+	ldm := LDMRecord{}
+
+	// read in control word (size) of LDM record
+	err := binary.Read(reader, binary.BigEndian, &ldm.Size)
+	if err != nil {
+		return nil, err
+	}
+
+	// As the control word contains a negative size under some circumstances,
+	// the absolute value of the control word must be used for determining
+	// the size of the block.
+	if ldm.Size < 0 {
+		ldm.Size = -ldm.Size
+	}
+
+	logrus.Debugf("---------------- LDM Compressed Record (%d bytes)----------------", ldm.Size)
+
+	bzipReader, _ := bzip2.NewReader(io.LimitReader(reader, int64(ldm.Size)), nil)
+
+	numMessages := 0
+	loadedRecord := &LoadedLDMRecord{
+		LDMRecord: ldm,
+	}
+
+	// read until no more messages are available
+	for {
+
+		numMessages += 1
+
+		// eat 12 bytes due to legacy compliance of CTM Header, these are all set to nil
+		io.ReadFull(bzipReader, make([]byte, 12))
+
+		header := MessageHeader{}
+		if err := binary.Read(bzipReader, binary.BigEndian, &header); err != nil {
+			if err != io.EOF {
+				return loadedRecord, err
+			}
+			break
+		}
+
+		logrus.WithFields(logrus.Fields{
+			"type": header.MessageType,
+			"seq":  header.IDSequenceNumber,
+			"size": header.MessageSize,
+		}).Tracef("== Message %d", header.MessageType)
+
+		switch header.MessageType {
+		case 2:
+			loadedRecord.M2 = &Message2{}
+			binary.Read(bzipReader, binary.BigEndian, loadedRecord.M2)
+			// skip the rest; 68 is the size of a Message2 record
+			io.ReadFull(bzipReader, make([]byte, MessageBodySize-68))
+		case 3:
+			loadedRecord.M3 = &Message3{}
+			binary.Read(bzipReader, binary.BigEndian, loadedRecord.M3)
+			io.ReadFull(bzipReader, make([]byte, MessageBodySize-960))
+		case 31:
+			sz := uint32(header.MessageSize)
+			// not sure if this is actually applicable
+			if sz == 65535 {
+				sz = uint32(header.NumMessageSegments)<<16 | uint32(header.MessageSegmentNum)
+			}
+			data := make([]byte, sz)
+			_, err := io.ReadFull(bzipReader, data)
+			if err != nil {
+				return loadedRecord, err
+			}
+			m31, err := NewMessage31(bytes.NewReader(data))
+			if err != nil {
+				return loadedRecord, err
+			}
+			loadedRecord.M31s = append(loadedRecord.M31s, m31)
+		default:
+			io.ReadFull(bzipReader, make([]byte, MessageBodySize))
+		}
+	}
+
+	return loadedRecord, nil
+}
+
+func (ar2 *Archive2) String() string {
+	return fmt.Sprintf("%s\n%s", ar2.VolumeHeader, ar2.RadarStatus)
+}
+
+func (ar2 *Archive2) AddFromLDMRecord(loadedRecord *LoadedLDMRecord) {
+	if loadedRecord.M2 != nil && ar2.RadarStatus == nil {
+		// keep a reference around
+		ar2.RadarStatus = loadedRecord.M2
+	}
+	if loadedRecord.M3 != nil && ar2.RadarPerformance == nil {
+		ar2.RadarPerformance = loadedRecord.M3
+	}
+	for _, m31 := range loadedRecord.M31s {
+		ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
+	}
+}
+
+// Extract returns a new Archive2 from the provided reader
+func Extract(reader io.Reader) (*Archive2, error) {
 
 	spew.Config.DisableMethods = true
 
@@ -38,95 +156,34 @@ func Extract(f io.ReadSeeker) *Archive2 {
 	// Archive II filename.
 
 	// read in the volume header record
-	binary.Read(f, binary.BigEndian, &ar2.VolumeHeader)
+	binary.Read(reader, binary.BigEndian, &ar2.VolumeHeader)
 
 	logrus.Debug(ar2.VolumeHeader)
 
-	// ------------------------------ LDM Records ------------------------------
+	offset := 24
 
-	// The first LDMRecord is the Metadata Record, consisting of 134 messages of
-	// Metadata message types 15, 13, 18, 3, 5, and 2
-
-	// Following the first LDM Metadata Record is a variable number of compressed
-	// records containing 120 radial messages (type 31) plus 0 or more RDA Status
-	// messages (type 2).
-
-	for {
-		ldm := LDMRecord{}
-
-		// read in control word (size) of LDM record
-		if err := binary.Read(f, binary.BigEndian, &ldm.Size); err != nil {
-			if err != io.EOF {
-				logrus.Panic(err.Error())
-			}
-			return &ar2
+	// read until no more LDM records are available
+	for true {
+		loadedRecord, err := ar2.LoadLDMRecord(reader)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, err
 		}
-
-		// As the control word contains a negative size under some circumstances,
-		// the absolute value of the control word must be used for determining
-		// the size of the block.
-		if ldm.Size < 0 {
-			ldm.Size = -ldm.Size
-		}
-
-		logrus.Debugf("---------------- LDM Compressed Record (%d bytes)----------------", ldm.Size)
-
-		msgBuf := decompress(f, ldm.Size)
-		numMessages := 0
-		messageCounts := map[uint8]int{}
-		for {
-
-			numMessages += 1
-
-			// eat 12 bytes due to legacy compliance of CTM Header, these are all set to nil
-			msgBuf.Seek(LegacyCTMHeaderLen, io.SeekCurrent)
-
-			header := MessageHeader{}
-			if err := binary.Read(msgBuf, binary.BigEndian, &header); err != nil {
-				if err != io.EOF {
-					logrus.Infof("processed %d messages", numMessages)
-					logrus.Panic(err.Error())
-				}
-				break
-			}
-
-			logrus.WithFields(logrus.Fields{
-				"type": header.MessageType,
-				"seq":  header.IDSequenceNumber,
-				"size": header.MessageSize,
-			}).Tracef("== Message %d", header.MessageType)
-
-			switch header.MessageType {
-			case 2:
-				m2 := Message2{}
-				binary.Read(msgBuf, binary.BigEndian, &m2)
-				// 68 is the size of a Message2 record
-				msgBuf.Seek(MessageBodySize-68, io.SeekCurrent)
-				// save a ref to most recent message 2
-				ar2.RadarStatus = &m2
-			case 3:
-				m3 := Message3{}
-				binary.Read(msgBuf, binary.BigEndian, &m3)
-				msgBuf.Seek(MessageBodySize-960, io.SeekCurrent)
-				ar2.RadarPerformance = &m3
-			case 31:
-				m31 := msg31(msgBuf)
-				// logrus.Trace(m31.Header.String())
-				ar2.ElevationScans[int(m31.Header.ElevationNumber)] = append(ar2.ElevationScans[int(m31.Header.ElevationNumber)], m31)
-			default:
-				_, err := msgBuf.Seek(MessageBodySize, io.SeekCurrent)
-				if err != nil {
-					logrus.Panic("failed to seek forward header message size")
-				}
-			}
-
-			messageCounts[header.MessageType]++
-		}
-		logrus.Debugf("ar2: message types received: %v", messageCounts)
+		ar2.LDMOffsets = append(ar2.LDMOffsets, offset)
+		offset += int(loadedRecord.LDMRecord.Size) + 4
+		ar2.LDMRecords = append(ar2.LDMRecords, loadedRecord)
+		ar2.AddFromLDMRecord(loadedRecord)
 	}
-	return &ar2
+
+	return &ar2, nil
 }
 
-func (ar2 *Archive2) String() string {
-	return fmt.Sprintf("%s\n%s", ar2.VolumeHeader, ar2.RadarStatus)
+func NewArchive2FromFile(filename string) (*Archive2, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return Extract(file)
 }

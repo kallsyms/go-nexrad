@@ -20,8 +20,8 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 
-	"github.com/bwiggs/go-nexrad/archive2"
 	"github.com/cheggaaa/pb/v3"
+	"github.com/kallsyms/go-nexrad/archive2"
 	"github.com/llgcode/draw2d/draw2dimg"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -140,7 +140,10 @@ func animate(dir, outdir, prod string) {
 					logrus.Error(err)
 					return
 				}
-				ar2 := archive2.Extract(f)
+				ar2, err := archive2.Extract(f)
+				if err != nil {
+					logrus.Panic(err)
+				}
 				f.Close()
 				elv := 1
 				if prod == "vel" {
@@ -175,7 +178,10 @@ func single(in, out, product string) {
 		return
 	}
 
-	ar2 := archive2.Extract(f)
+	ar2, err := archive2.Extract(f)
+	if err != nil {
+		logrus.Panic(err)
+	}
 	fmt.Println(ar2)
 	elv := 1
 	// if product != "ref" {

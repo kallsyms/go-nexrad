@@ -94,7 +94,7 @@ func (h *Message31Header) AzimuthResolutionSpacing() float64 {
 	return 1
 }
 
-func msg31(r *bytes.Reader) *Message31 {
+func NewMessage31(r *bytes.Reader) (*Message31, error) {
 	m31h := Message31Header{}
 	startPos, _ := r.Seek(0, io.SeekCurrent)
 
@@ -133,7 +133,7 @@ func msg31(r *bytes.Reader) *Message31 {
 
 		d := DataBlock{}
 		if err := binary.Read(r, binary.BigEndian, &d); err != nil {
-			logrus.Panic(err.Error())
+			return nil, err
 		}
 
 		// rewind, so we can reread the blockname in the struct processors
@@ -163,7 +163,7 @@ func msg31(r *bytes.Reader) *Message31 {
 			// bits stored for each gate (DWS is always a multiple of 8).
 			ldm := m.NumberDataMomentGates * uint16(m.DataWordSize) / 8
 			data := make([]uint8, ldm)
-			binary.Read(r, binary.BigEndian, &data)
+			io.ReadFull(r, data)
 
 			d := &DataMoment{
 				GenericDataMoment: m,
@@ -186,8 +186,9 @@ func msg31(r *bytes.Reader) *Message31 {
 			}
 		default:
 			// preview(r, 256)
-			logrus.Panicf("Data Block - unknown type '%s'", blockName)
+			return nil, fmt.Errorf("Data Block - unknown type '%s'", blockName)
 		}
 	}
-	return &m31
+
+	return &m31, nil
 }

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/bwiggs/go-nexrad/archive2"
+	"github.com/kallsyms/go-nexrad/archive2"
 	"github.com/sirupsen/logrus"
 )
 
