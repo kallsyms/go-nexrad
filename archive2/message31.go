@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // Message31 Digital Radar Data Generic Format
@@ -110,19 +108,19 @@ func NewMessage31(r *bytes.Reader) (*Message31, error) {
 	var err error
 	_, err = r.Seek(int64(m31.Header.VOLDataBlockPtr)+startPos, io.SeekStart)
 	if err != nil {
-		logrus.Panicf("failed to seek to VOL pointer offset: %s", err)
+		return nil, fmt.Errorf("failed to seek to VOL pointer offset: %s", err)
 	}
 	binary.Read(r, binary.BigEndian, &m31.VolumeData)
 
 	_, err = r.Seek(int64(m31.Header.ELVDataBlockPtr)+startPos, io.SeekStart)
 	if err != nil {
-		logrus.Panicf("failed to seek to ELV pointer offset: %s", err)
+		return nil, fmt.Errorf("failed to seek to ELV pointer offset: %s", err)
 	}
 	binary.Read(r, binary.BigEndian, &m31.ElevationData)
 
 	_, err = r.Seek(int64(m31.Header.RADDataBlockPtr)+startPos, io.SeekStart)
 	if err != nil {
-		logrus.Panicf("failed to seek to RAD pointer offset: %s", err)
+		return nil, fmt.Errorf("failed to seek to RAD pointer offset: %s", err)
 	}
 	binary.Read(r, binary.BigEndian, &m31.RadialData)
 

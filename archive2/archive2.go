@@ -59,11 +59,11 @@ func (ar2 *Archive2) LoadLDMRecord(reader io.Reader) (*LoadedLDMRecord, error) {
 	bzipReader, _ := bzip2.NewReader(io.LimitReader(reader, int64(ldm.Size)), nil)
 
 	numMessages := 0
+	messageCounts := map[uint8]int{}
 	loadedRecord := &LoadedLDMRecord{
 		LDMRecord: ldm,
 	}
 
-	// read until no more messages are available
 	for {
 
 		numMessages += 1
@@ -96,11 +96,18 @@ func (ar2 *Archive2) LoadLDMRecord(reader io.Reader) (*LoadedLDMRecord, error) {
 			binary.Read(bzipReader, binary.BigEndian, loadedRecord.M3)
 			io.ReadFull(bzipReader, make([]byte, MessageBodySize-960))
 		case 31:
+			// in half-words (uint16)
 			sz := uint32(header.MessageSize)
 			// not sure if this is actually applicable
 			if sz == 65535 {
 				sz = uint32(header.NumMessageSegments)<<16 | uint32(header.MessageSegmentNum)
 			}
+
+			// convert to byte count
+			sz *= 2
+			// minus size of header
+			sz -= 16
+
 			data := make([]byte, sz)
 			_, err := io.ReadFull(bzipReader, data)
 			if err != nil {
@@ -114,7 +121,10 @@ func (ar2 *Archive2) LoadLDMRecord(reader io.Reader) (*LoadedLDMRecord, error) {
 		default:
 			io.ReadFull(bzipReader, make([]byte, MessageBodySize))
 		}
+
+		messageCounts[header.MessageType]++
 	}
+	logrus.Debugf("ar2: message types received: %v", messageCounts)
 
 	return loadedRecord, nil
 }
@@ -162,8 +172,16 @@ func Extract(reader io.Reader) (*Archive2, error) {
 
 	offset := 24
 
-	// read until no more LDM records are available
-	for true {
+	// ------------------------------ LDM Records ------------------------------
+
+	// The first LDMRecord is the Metadata Record, consisting of 134 messages of
+	// Metadata message types 15, 13, 18, 3, 5, and 2
+
+	// Following the first LDM Metadata Record is a variable number of compressed
+	// records containing 120 radial messages (type 31) plus 0 or more RDA Status
+	// messages (type 2).
+
+	for {
 		loadedRecord, err := ar2.LoadLDMRecord(reader)
 		if err == io.EOF {
 			break
