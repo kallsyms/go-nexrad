@@ -161,7 +161,7 @@ func NewMessage31(r *bytes.Reader) (*Message31, error) {
 			// bits stored for each gate (DWS is always a multiple of 8).
 			ldm := m.NumberDataMomentGates * uint16(m.DataWordSize) / 8
 			data := make([]uint8, ldm)
-			io.ReadFull(r, data)
+			binary.Read(r, binary.BigEndian, data)
 
 			d := &DataMoment{
 				GenericDataMoment: m,
